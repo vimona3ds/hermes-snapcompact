@@ -1,4 +1,4 @@
-name: snapcompact
+name: hermes-snapcompact
 version: "1.0.0"
 description: >
   Snapcompact context engine: compress conversation history into dense
