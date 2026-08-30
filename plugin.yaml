@@ -1,0 +1,9 @@
+name: snapcompact
+version: "1.0.0"
+description: >
+  Snapcompact context engine: compress conversation history into dense
+  bitmap PNG frames that vision-capable LLMs read back at ~1/3 the token cost.
+  Uses @oh-my-pi/snapcompact for rendering. No LLM call, fully local and
+  deterministic.
+author: johnytest
+license: MIT

@@ -1,0 +1,8 @@
+{
+  "name": "hermes-snapcompact-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@oh-my-pi/snapcompact": "^18.0.0"
+  }
+}

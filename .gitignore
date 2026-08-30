@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+bridge/node_modules/
+bridge/bun.lock
+.DS_Store
