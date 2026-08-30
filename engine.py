@@ -379,6 +379,12 @@ class SnapcompactEngine(ContextEngine):
             return messages
 
         if self._llm is None:
+            ok, detail = self.ensure_ready()
+            if not ok:
+                raise RuntimeError(
+                    "compression unavailable: summarize mode has no LLM access "
+                    f"and snapcompact fallback is not ready ({detail})"
+                )
             logger.warning("summarize: no LLM access; falling back to snapcompact mode")
             return self._compress_snapcompact(
                 messages, current_tokens, focus_topic, force, memory_context,
@@ -394,6 +400,8 @@ class SnapcompactEngine(ContextEngine):
         try:
             summary = self._llm.complete(prompt)
         except Exception:
+            if not self.bridge_ready():
+                raise
             logger.exception("LLM summary failed; falling back to snapcompact mode")
             return self._compress_snapcompact(
                 messages, current_tokens, focus_topic, force, memory_context,
@@ -476,31 +484,58 @@ class SnapcompactEngine(ContextEngine):
                 conversation.append(msg)
         return system, conversation
 
-    def _ensure_bridge(self) -> None:
-        """Verify the bridge script and node_modules exist."""
+    def ensure_ready(self) -> tuple[bool, str]:
+        """Verify (and if needed set up) the rendering bridge.
+
+        Called eagerly at plugin registration so problems surface at startup
+        with an actionable message — never mid-session.  Returns
+        ``(ok, detail)``; ``detail`` names the exact fix when not ok.
+        """
         if self._bridge_checked:
-            return
+            return True, "ready"
         if not _BRIDGE_SCRIPT.is_file():
-            raise FileNotFoundError(
-                f"snapcompact bridge script not found at {_BRIDGE_SCRIPT}. "
-                f"Is the plugin installed correctly?"
+            return False, (
+                f"bridge script missing at {_BRIDGE_SCRIPT} — reinstall the plugin"
+            )
+        try:
+            bun = _find_bun()
+        except FileNotFoundError:
+            return False, (
+                "Bun is not installed. Fix: curl -fsSL https://bun.sh/install | bash"
             )
         node_modules = _BRIDGE_DIR / "node_modules"
         if not node_modules.is_dir():
             logger.info("snapcompact: installing bridge dependencies...")
             try:
-                bun = _find_bun()
                 subprocess.run(
                     [bun, "install"],
                     cwd=str(_BRIDGE_DIR),
                     capture_output=True,
                     text=True,
                     check=True,
-                    timeout=60,
+                    timeout=120,
                 )
-            except Exception:
-                raise RuntimeError(
-                    f"Failed to install snapcompact bridge dependencies. "
-                    f"Run 'cd {_BRIDGE_DIR} && bun install' manually."
-                ) from None
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or "").strip()[-500:]
+                return False, (
+                    f"bun install failed: {detail} — "
+                    f"run 'cd {_BRIDGE_DIR} && bun install' manually"
+                )
+            except Exception as exc:
+                return False, (
+                    f"bun install failed ({exc}) — "
+                    f"run 'cd {_BRIDGE_DIR} && bun install' manually"
+                )
         self._bridge_checked = True
+        return True, "ready"
+
+    def bridge_ready(self) -> bool:
+        """Non-raising readiness probe."""
+        ok, _ = self.ensure_ready()
+        return ok
+
+    def _ensure_bridge(self) -> None:
+        """Raise with an actionable message when the bridge is unusable."""
+        ok, detail = self.ensure_ready()
+        if not ok:
+            raise RuntimeError(f"snapcompact bridge unavailable: {detail}")

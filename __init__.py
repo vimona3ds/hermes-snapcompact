@@ -73,17 +73,34 @@ def register(ctx):
 
     _auto_activate_engine()
 
+    # Set up the rendering bridge NOW, at plugin load — so a missing Bun or
+    # failed dependency install surfaces at startup with a fix, never
+    # mid-session when compression fires.
+    ready, detail = engine.ensure_ready()
+    if not ready:
+        logger.warning(
+            "snapcompact: bitmap rendering unavailable — %s. "
+            "Compaction still works in summarize mode; "
+            "/compact-mode snapcompact will not until this is fixed.",
+            detail,
+        )
+
     # -- /compact-mode --------------------------------------------------------
 
     def handle_compact_mode(args):
         arg = args.strip().lower() if args else ""
 
         if not arg:
+            ok, bridge_detail = engine.ensure_ready()
+            bridge_note = "" if ok else (
+                f"\n\n⚠️ snapcompact mode unavailable: {bridge_detail}"
+            )
             return (
                 f"Current compaction mode: **{engine.mode}**\n\n"
                 f"Usage: `/compact-mode <mode>`\n\n"
                 f"  `snapcompact` — bitmap-frame archive (local, no LLM call, ~1/3 tokens)\n"
                 f"  `summarize`   — LLM prose summary (current Hermes default)"
+                f"{bridge_note}"
             )
 
         if arg not in _VALID_MODES:
@@ -91,6 +108,14 @@ def register(ctx):
                 f"Unknown mode `{arg}`. "
                 f"Choose: {', '.join(f'`{m}`' for m in _VALID_MODES)}"
             )
+
+        if arg == "snapcompact":
+            ok, bridge_detail = engine.ensure_ready()
+            if not ok:
+                return (
+                    f"Cannot switch to `snapcompact`: {bridge_detail}\n"
+                    f"Staying on `{engine.mode}`."
+                )
 
         old = engine.mode
         if old == arg:
