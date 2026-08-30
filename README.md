@@ -14,9 +14,10 @@ When the conversation context fills up, renders old turns into dense bitmap PNG 
 
 ```bash
 hermes plugins install vimona3ds/hermes-snapcompact --enable
+cd ~/.hermes/plugins/hermes-snapcompact/bridge && bun install
 ```
 
-That's it. Restart Hermes. The plugin auto-configures itself — your existing compaction behavior is unchanged until you opt in.
+Restart Hermes. The plugin auto-configures itself — your existing compaction behavior is unchanged until you opt in. The plugin never installs anything itself: if Bun or the bridge dependencies are missing, it flags the exact fix at startup and in `/compact-mode`, and compaction keeps working in summarize mode.
 
 ## Usage
 
@@ -46,7 +47,7 @@ Frame shapes are provider-aware and selected from SQuAD recall evals:
 ## Caveats
 
 - **Vision required.** Non-vision models can't read the bitmap frames. The engine will still work (text edges are preserved verbatim) but middle history will be opaque.
-- **Bun dependency.** The native renderer in @oh-my-pi/snapcompact requires Bun. The bridge auto-installs npm dependencies on first use if Bun is on PATH.
+- **Bun dependency.** The native renderer in @oh-my-pi/snapcompact requires Bun. The plugin only detects and flags a missing setup — it never installs anything.
 - **Image token billing.** While input tokens drop ~3x, models spend extra output/thinking tokens decoding the images. The technique shines at 100k+ token sessions.
 
 ## License

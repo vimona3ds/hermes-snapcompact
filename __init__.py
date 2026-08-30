@@ -12,6 +12,7 @@ to switch to bitmap-frame archival.  Switch back any time with:
 
 import logging
 import os
+import sys
 
 from .engine import SnapcompactEngine
 
@@ -73,17 +74,18 @@ def register(ctx):
 
     _auto_activate_engine()
 
-    # Set up the rendering bridge NOW, at plugin load — so a missing Bun or
-    # failed dependency install surfaces at startup with a fix, never
-    # mid-session when compression fires.
+    # Probe the rendering bridge NOW, at plugin load — detection only, we
+    # never install anything.  logger goes to the log file; print() makes
+    # sure the user actually sees it in the terminal at startup.
     ready, detail = engine.ensure_ready()
     if not ready:
-        logger.warning(
-            "snapcompact: bitmap rendering unavailable — %s. "
-            "Compaction still works in summarize mode; "
-            "/compact-mode snapcompact will not until this is fixed.",
-            detail,
+        notice = (
+            f"[snapcompact] bitmap rendering unavailable: {detail}\n"
+            f"[snapcompact] compaction still works (summarize mode); "
+            f"/compact-mode snapcompact is disabled until fixed."
         )
+        print(notice, file=sys.stderr)
+        logger.warning(notice)
 
     # -- /compact-mode --------------------------------------------------------
 

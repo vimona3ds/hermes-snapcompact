@@ -485,11 +485,10 @@ class SnapcompactEngine(ContextEngine):
         return system, conversation
 
     def ensure_ready(self) -> tuple[bool, str]:
-        """Verify (and if needed set up) the rendering bridge.
+        """Detect whether the rendering bridge is usable.
 
-        Called eagerly at plugin registration so problems surface at startup
-        with an actionable message — never mid-session.  Returns
-        ``(ok, detail)``; ``detail`` names the exact fix when not ok.
+        Detection ONLY — never installs anything on the user's machine.
+        Returns ``(ok, detail)``; ``detail`` names the exact fix when not ok.
         """
         if self._bridge_checked:
             return True, "ready"
@@ -498,34 +497,19 @@ class SnapcompactEngine(ContextEngine):
                 f"bridge script missing at {_BRIDGE_SCRIPT} — reinstall the plugin"
             )
         try:
-            bun = _find_bun()
+            _find_bun()
         except FileNotFoundError:
             return False, (
-                "Bun is not installed. Fix: curl -fsSL https://bun.sh/install | bash"
+                "Bun is not installed (https://bun.sh). "
+                "Install it, then run: "
+                f"cd {_BRIDGE_DIR} && bun install"
             )
         node_modules = _BRIDGE_DIR / "node_modules"
         if not node_modules.is_dir():
-            logger.info("snapcompact: installing bridge dependencies...")
-            try:
-                subprocess.run(
-                    [bun, "install"],
-                    cwd=str(_BRIDGE_DIR),
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=120,
-                )
-            except subprocess.CalledProcessError as exc:
-                detail = (exc.stderr or exc.stdout or "").strip()[-500:]
-                return False, (
-                    f"bun install failed: {detail} — "
-                    f"run 'cd {_BRIDGE_DIR} && bun install' manually"
-                )
-            except Exception as exc:
-                return False, (
-                    f"bun install failed ({exc}) — "
-                    f"run 'cd {_BRIDGE_DIR} && bun install' manually"
-                )
+            return False, (
+                f"bridge dependencies not installed. Run: "
+                f"cd {_BRIDGE_DIR} && bun install"
+            )
         self._bridge_checked = True
         return True, "ready"
 
