@@ -1,11 +1,8 @@
 # hermes-snapcompact
 
-Dual-mode context engine plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+Snapcompact context engine plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-- **snapcompact** (default) — renders old turns into dense bitmap PNG frames that vision-capable models read back at roughly **1/3 the input token cost**. Local, deterministic, no LLM call. Powered by [@oh-my-pi/snapcompact](https://github.com/can1357/oh-my-pi/tree/main/packages/snapcompact), the technique behind [Stencil's write-up](https://stencil.so/blog/snapcompact).
-- **summarize** — classic LLM prose summary using the host model. The traditional approach when you want a concise handoff document instead of a pixel archive.
-
-Switch modes at any time with `/compact-mode`.
+When the conversation context fills up, renders old turns into dense bitmap PNG frames that vision-capable models read back at roughly **1/3 the input token cost** — with near-perfect recall. Powered by [@oh-my-pi/snapcompact](https://github.com/can1357/oh-my-pi/tree/main/packages/snapcompact).
 
 ## Requirements
 
@@ -16,24 +13,20 @@ Switch modes at any time with `/compact-mode`.
 ## Install
 
 ```bash
-# Clone into the Hermes context engine plugin directory
-git clone https://github.com/johnytest/hermes-snapcompact.git \
-    ~/.hermes/plugins/context_engine/snapcompact
-
-# Install the rendering bridge dependencies
-cd ~/.hermes/plugins/context_engine/snapcompact/bridge
-bun install
+hermes plugins install vimona3ds/hermes-snapcompact --enable
 ```
 
-Then set the engine in your Hermes config:
+That's it. Restart Hermes. The plugin auto-configures itself — your existing compaction behavior is unchanged until you opt in.
 
-```yaml
-# ~/.hermes/config.yaml
-context:
-  engine: snapcompact
+## Usage
+
+```
+/compact-mode                  # show current mode
+/compact-mode snapcompact      # switch to bitmap-frame archive
+/compact-mode summarize        # switch back to LLM prose summary
 ```
 
-Restart Hermes — the engine is active. When context hits ~75% of the model's window, old turns are archived into bitmap frames automatically.
+The default mode is `summarize` — identical to the built-in compressor. When you switch to `snapcompact`, old turns are rendered into dense PNG frames instead of being summarized by an LLM. Switch back any time.
 
 ## How it works
 
@@ -50,29 +43,11 @@ Frame shapes are provider-aware and selected from SQuAD recall evals:
 | OpenAI | `8on22-bw` | Same line-spacing win; `detail: "original"` for patch billing |
 | Unknown | `8on22-bw` | Safe default with Anthropic-style billing estimate |
 
-## Modes
-
-The engine ships two compaction strategies. Switch between them live — no restart needed:
-
-```
-/compact-mode                  # show current mode
-/compact-mode snapcompact      # bitmap-frame archive (default)
-/compact-mode summarize        # LLM prose summary
-```
-
-Both modes use the same message protection rules (`protect_first_n` / `protect_last_n`) and trigger at the same threshold.
-
-## Configuration
-
-The engine uses sensible defaults. No additional configuration beyond `context.engine: snapcompact` is needed.
-
-The standard `compression.threshold` and `compression.protect_last_n` settings from Hermes apply — the engine reads `threshold_percent` (default 0.75) and `protect_first_n` / `protect_last_n` (default 3/6) from the context engine contract.
-
 ## Caveats
 
 - **Vision required.** Non-vision models can't read the bitmap frames. The engine will still work (text edges are preserved verbatim) but middle history will be opaque.
-- **Bun dependency.** The native renderer in @oh-my-pi/snapcompact requires Bun. Node.js is not supported.
-- **Image token billing.** While input tokens drop ~3×, models spend extra output/thinking tokens decoding the images. For short contexts this can offset the savings. The technique shines at 100k+ token sessions.
+- **Bun dependency.** The native renderer in @oh-my-pi/snapcompact requires Bun. The bridge auto-installs npm dependencies on first use if Bun is on PATH.
+- **Image token billing.** While input tokens drop ~3x, models spend extra output/thinking tokens decoding the images. The technique shines at 100k+ token sessions.
 
 ## License
 

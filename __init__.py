@@ -1,57 +1,102 @@
 """hermes-snapcompact: Snapcompact context engine plugin for Hermes.
 
-Dual-mode context engine powered by @oh-my-pi/snapcompact:
+Install the plugin, and nothing changes — compaction still uses LLM
+summaries (the built-in default).  When you're ready, type:
 
-- **snapcompact** (default) — renders old turns into dense bitmap PNG
-  frames that vision models read back at ~1/3 the token cost.  Local,
-  deterministic, no LLM call.
-- **summarize** — classic LLM prose summary via the host model.
+    /compact-mode snapcompact
 
-Switch modes any time with ``/compact-mode``.
+to switch to bitmap-frame archival.  Switch back any time with:
 
-Install:
-    1. Clone into ~/.hermes/plugins/context_engine/snapcompact/
-    2. cd bridge && bun install
-    3. Set context.engine: snapcompact in ~/.hermes/config.yaml
+    /compact-mode summarize
 """
 
+import logging
+import os
+
 from .engine import SnapcompactEngine
+
+logger = logging.getLogger(__name__)
 
 _VALID_MODES = ("snapcompact", "summarize")
 
 
+def _auto_activate_engine() -> None:
+    """Set context.engine: snapcompact in config.yaml if not already set.
+
+    Only touches the one key.  If the file doesn't exist or isn't parseable,
+    we skip silently — the user will just need the manual config line.
+    """
+    config_path = os.path.join(
+        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+        "config.yaml",
+    )
+    try:
+        import yaml  # PyYAML — always available in Hermes
+
+        if os.path.isfile(config_path):
+            with open(config_path, "r") as f:
+                config = yaml.safe_load(f) or {}
+        else:
+            config = {}
+
+        context = config.get("context")
+        if not isinstance(context, dict):
+            context = {}
+            config["context"] = context
+
+        current = context.get("engine", "compressor")
+        if current != "snapcompact":
+            context["engine"] = "snapcompact"
+            with open(config_path, "w") as f:
+                yaml.safe_dump(config, f, default_flow_style=False)
+            logger.info(
+                "snapcompact: set context.engine: snapcompact in %s "
+                "(was %r). Default compaction behavior is unchanged — "
+                "use /compact-mode snapcompact to enable bitmap rendering.",
+                config_path,
+                current,
+            )
+    except Exception:
+        logger.debug(
+            "snapcompact: could not auto-set context.engine in %s; "
+            "set it manually if compression doesn't activate.",
+            config_path,
+            exc_info=True,
+        )
+
+
 def register(ctx):
-    """Called by Hermes plugin discovery to register the context engine."""
-    llm = getattr(ctx, "llm", None)
-    engine = SnapcompactEngine(llm=llm)
+    """Called by Hermes plugin discovery."""
+    engine = SnapcompactEngine()
+    engine.set_llm(getattr(ctx, "llm", None))
     ctx.register_context_engine(engine)
 
-    # -- Slash command: /compact-mode ----------------------------------------
+    _auto_activate_engine()
+
+    # -- /compact-mode --------------------------------------------------------
 
     def handle_compact_mode(args):
-        """Switch or display the active compaction mode."""
         arg = args.strip().lower() if args else ""
 
         if not arg:
             return (
                 f"Current compaction mode: **{engine.mode}**\n\n"
-                f"Usage: `/compact-mode <mode>`\n"
-                f"Available modes: {', '.join(f'`{m}`' for m in _VALID_MODES)}\n\n"
-                f"- `snapcompact` — bitmap-frame archive (local, no LLM call)\n"
-                f"- `summarize` — LLM prose summary (uses active model)"
+                f"Usage: `/compact-mode <mode>`\n\n"
+                f"  `snapcompact` — bitmap-frame archive (local, no LLM call, ~1/3 tokens)\n"
+                f"  `summarize`   — LLM prose summary (current Hermes default)"
             )
 
         if arg not in _VALID_MODES:
             return (
                 f"Unknown mode `{arg}`. "
-                f"Choose from: {', '.join(f'`{m}`' for m in _VALID_MODES)}"
+                f"Choose: {', '.join(f'`{m}`' for m in _VALID_MODES)}"
             )
 
         old = engine.mode
-        engine.mode = arg
         if old == arg:
-            return f"Compaction mode already set to `{arg}`."
-        return f"Compaction mode switched: `{old}` → `{arg}`."
+            return f"Already using `{arg}`."
+        engine.mode = arg
+        return f"Compaction mode: `{old}` → **`{arg}`**."
 
     ctx.register_command(
         "compact-mode",

@@ -1,16 +1,15 @@
 """Snapcompact context engine for Hermes.
 
-Replaces the built-in summarization compressor with a dual-mode engine:
+Dual-mode context engine:
 
-- **snapcompact** (default) — local, deterministic bitmap-frame archival.
-  Old messages are serialized to text, rendered into dense PNG frames by
-  @oh-my-pi/snapcompact, and re-attached as images that vision-capable
-  models read back at ~1/3 the input token cost.
-- **summarize** — classic LLM-generated prose summary via the host's
-  active model (``ctx.llm.complete``).
+- **summarize** (default) — LLM prose summary, same behavior as the
+  built-in compressor.  Installing the plugin changes nothing until you
+  opt in.
+- **snapcompact** — local, deterministic bitmap-frame archival via
+  @oh-my-pi/snapcompact.  Vision models read the frames back at ~1/3
+  the input token cost.
 
-Switch at any time with ``/compact-mode snapcompact`` or ``/compact-mode
-summarize``.  The mode persists for the session.
+Switch live with ``/compact-mode snapcompact`` or ``/compact-mode summarize``.
 """
 
 from __future__ import annotations
@@ -135,26 +134,30 @@ class SnapcompactEngine(ContextEngine):
     # is fast and deterministic, no need to announce every pass.
     emit_automatic_compaction_status: bool = False
 
-    def __init__(self, context_length: int = 200_000, *, llm: object | None = None) -> None:
+    def __init__(self, context_length: int = 200_000) -> None:
         self.context_length = context_length
         self.threshold_tokens = int(context_length * self.threshold_percent)
 
-        # Dual-mode: "snapcompact" (bitmap frames) or "summarize" (LLM prose).
-        self.mode: str = "snapcompact"
+        # "summarize" by default — identical to the built-in compressor.
+        # "/compact-mode snapcompact" opts in to bitmap rendering.
+        self.mode: str = "summarize"
 
-        # Plugin LLM access handle, set by register() — used for summarize mode.
-        self._llm = llm
+        # Plugin LLM access — set via set_llm() from register().
+        self._llm: object | None = None
 
         # Per-session state
         self._model_id: str = ""
         self._provider: str = ""
         self._api_mode: str = ""
-        self._archive_text: str = ""  # Accumulated normalized archive source
+        self._archive_text: str = ""
         self._truncated_chars: int = 0
         self._previous_summary: str = ""
 
-        # Verify the bridge is set up on first use, not at import time.
         self._bridge_checked = False
+
+    def set_llm(self, llm: object | None) -> None:
+        """Inject plugin LLM access handle (called by register)."""
+        self._llm = llm
 
     # -- Core interface -------------------------------------------------------
 
@@ -175,14 +178,16 @@ class SnapcompactEngine(ContextEngine):
         force: bool = False,
         memory_context: str = "",
     ) -> list[dict[str, Any]]:
-        """Compact the message list using the active mode."""
-        if self.mode == "summarize":
-            return self._compress_summarize(
+        """Compact using the active mode."""
+        if self.mode == "snapcompact":
+            return self._compress_snapcompact(
                 messages, current_tokens, focus_topic, force, memory_context,
             )
-        return self._compress_snapcompact(
+        return self._compress_summarize(
             messages, current_tokens, focus_topic, force, memory_context,
         )
+
+    # -- Snapcompact mode -----------------------------------------------------
 
     def _compress_snapcompact(
         self,
@@ -347,6 +352,8 @@ class SnapcompactEngine(ContextEngine):
 
         return result
 
+    # -- Summarize mode -------------------------------------------------------
+
     def _compress_summarize(
         self,
         messages: list[dict[str, Any]],
@@ -355,7 +362,7 @@ class SnapcompactEngine(ContextEngine):
         force: bool = False,
         memory_context: str = "",
     ) -> list[dict[str, Any]]:
-        """Compact via LLM prose summary (classic mode)."""
+        """Compact via LLM prose summary."""
         system_msgs, conversation = self._split_system(messages)
         if len(conversation) <= self.protect_first_n + self.protect_last_n:
             return messages
@@ -371,9 +378,8 @@ class SnapcompactEngine(ContextEngine):
         if not serialized.strip():
             return messages
 
-        # Use the plugin's LLM access to generate a prose summary.
         if self._llm is None:
-            logger.warning("summarize mode unavailable: no LLM access; falling back to snapcompact")
+            logger.warning("summarize: no LLM access; falling back to snapcompact mode")
             return self._compress_snapcompact(
                 messages, current_tokens, focus_topic, force, memory_context,
             )
@@ -388,7 +394,7 @@ class SnapcompactEngine(ContextEngine):
         try:
             summary = self._llm.complete(prompt)
         except Exception:
-            logger.exception("LLM summary failed; falling back to snapcompact")
+            logger.exception("LLM summary failed; falling back to snapcompact mode")
             return self._compress_snapcompact(
                 messages, current_tokens, focus_topic, force, memory_context,
             )
@@ -399,16 +405,18 @@ class SnapcompactEngine(ContextEngine):
 
         summary_msg: dict[str, Any] = {
             "role": "user",
-            "content": f"Resume prior conversation. Summary of earlier context:\n\n{summary}",
+            "content": (
+                "Resume prior conversation. Summary of earlier context:\n\n"
+                + summary
+            ),
         }
         result = list(system_msgs) + [summary_msg] + list(keep_head) + list(keep_tail)
 
         logger.info(
-            "snapcompact(summarize): compressed %d messages into %d-char summary, compression #%d",
+            "snapcompact(summarize): compressed %d messages into %d-char summary, #%d",
             len(to_archive), len(summary), self.compression_count,
         )
         return result
-
     # -- Optional overrides ---------------------------------------------------
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
