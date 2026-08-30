@@ -1,9 +1,16 @@
 """Snapcompact context engine for Hermes.
 
-Replaces the built-in summarization compressor with a local, deterministic
-bitmap-frame archival pass: old messages are serialized to text, rendered
-into dense PNG frames by @oh-my-pi/snapcompact, and re-attached as images
-that vision-capable models read back at ~1/3 the input token cost.
+Replaces the built-in summarization compressor with a dual-mode engine:
+
+- **snapcompact** (default) — local, deterministic bitmap-frame archival.
+  Old messages are serialized to text, rendered into dense PNG frames by
+  @oh-my-pi/snapcompact, and re-attached as images that vision-capable
+  models read back at ~1/3 the input token cost.
+- **summarize** — classic LLM-generated prose summary via the host's
+  active model (``ctx.llm.complete``).
+
+Switch at any time with ``/compact-mode snapcompact`` or ``/compact-mode
+summarize``.  The mode persists for the session.
 """
 
 from __future__ import annotations
@@ -128,9 +135,15 @@ class SnapcompactEngine(ContextEngine):
     # is fast and deterministic, no need to announce every pass.
     emit_automatic_compaction_status: bool = False
 
-    def __init__(self, context_length: int = 200_000) -> None:
+    def __init__(self, context_length: int = 200_000, *, llm: object | None = None) -> None:
         self.context_length = context_length
         self.threshold_tokens = int(context_length * self.threshold_percent)
+
+        # Dual-mode: "snapcompact" (bitmap frames) or "summarize" (LLM prose).
+        self.mode: str = "snapcompact"
+
+        # Plugin LLM access handle, set by register() — used for summarize mode.
+        self._llm = llm
 
         # Per-session state
         self._model_id: str = ""
@@ -162,7 +175,24 @@ class SnapcompactEngine(ContextEngine):
         force: bool = False,
         memory_context: str = "",
     ) -> list[dict[str, Any]]:
-        """Compact the message list using snapcompact bitmap rendering."""
+        """Compact the message list using the active mode."""
+        if self.mode == "summarize":
+            return self._compress_summarize(
+                messages, current_tokens, focus_topic, force, memory_context,
+            )
+        return self._compress_snapcompact(
+            messages, current_tokens, focus_topic, force, memory_context,
+        )
+
+    def _compress_snapcompact(
+        self,
+        messages: list[dict[str, Any]],
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
+        force: bool = False,
+        memory_context: str = "",
+    ) -> list[dict[str, Any]]:
+        """Compact via bitmap-frame rendering."""
         self._ensure_bridge()
 
         # Identify which messages to archive vs keep.
@@ -317,6 +347,68 @@ class SnapcompactEngine(ContextEngine):
 
         return result
 
+    def _compress_summarize(
+        self,
+        messages: list[dict[str, Any]],
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
+        force: bool = False,
+        memory_context: str = "",
+    ) -> list[dict[str, Any]]:
+        """Compact via LLM prose summary (classic mode)."""
+        system_msgs, conversation = self._split_system(messages)
+        if len(conversation) <= self.protect_first_n + self.protect_last_n:
+            return messages
+
+        keep_head = conversation[: self.protect_first_n]
+        keep_tail = conversation[-self.protect_last_n :]
+        to_archive = conversation[self.protect_first_n : -self.protect_last_n]
+        if not to_archive:
+            return messages
+
+        is_anthropic = "claude" in self._model_id.lower() or self._provider == "anthropic"
+        serialized = serialize_messages(to_archive, include_thinking=not is_anthropic)
+        if not serialized.strip():
+            return messages
+
+        # Use the plugin's LLM access to generate a prose summary.
+        if self._llm is None:
+            logger.warning("summarize mode unavailable: no LLM access; falling back to snapcompact")
+            return self._compress_snapcompact(
+                messages, current_tokens, focus_topic, force, memory_context,
+            )
+
+        focus = f" Focus on preserving details about: {focus_topic}" if focus_topic else ""
+        prompt = (
+            "Summarize the following conversation history into a concise but "
+            "complete handoff document. Preserve key decisions, file paths, "
+            "code changes, error details, and current task state. Do NOT "
+            f"omit actionable specifics.{focus}\n\n{serialized}"
+        )
+        try:
+            summary = self._llm.complete(prompt)
+        except Exception:
+            logger.exception("LLM summary failed; falling back to snapcompact")
+            return self._compress_snapcompact(
+                messages, current_tokens, focus_topic, force, memory_context,
+            )
+
+        self._previous_summary = summary
+        self.compression_count += 1
+        self.last_prompt_tokens = -1
+
+        summary_msg: dict[str, Any] = {
+            "role": "user",
+            "content": f"Resume prior conversation. Summary of earlier context:\n\n{summary}",
+        }
+        result = list(system_msgs) + [summary_msg] + list(keep_head) + list(keep_tail)
+
+        logger.info(
+            "snapcompact(summarize): compressed %d messages into %d-char summary, compression #%d",
+            len(to_archive), len(summary), self.compression_count,
+        )
+        return result
+
     # -- Optional overrides ---------------------------------------------------
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
@@ -350,6 +442,7 @@ class SnapcompactEngine(ContextEngine):
     def get_status(self) -> dict[str, Any]:
         status = super().get_status()
         status["engine"] = "snapcompact"
+        status["mode"] = self.mode
         status["archive_chars"] = len(self._archive_text)
         return status
 

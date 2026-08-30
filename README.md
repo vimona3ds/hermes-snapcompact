@@ -1,10 +1,11 @@
 # hermes-snapcompact
 
-Snapcompact context engine plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+Dual-mode context engine plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-When the conversation context fills up, instead of asking an LLM to summarize (lossy, slow, expensive), this engine renders the old turns into dense bitmap PNG frames that vision-capable models read back at roughly **1/3 the input token cost** — with near-perfect recall.
+- **snapcompact** (default) — renders old turns into dense bitmap PNG frames that vision-capable models read back at roughly **1/3 the input token cost**. Local, deterministic, no LLM call. Powered by [@oh-my-pi/snapcompact](https://github.com/can1357/oh-my-pi/tree/main/packages/snapcompact), the technique behind [Stencil's write-up](https://stencil.so/blog/snapcompact).
+- **summarize** — classic LLM prose summary using the host model. The traditional approach when you want a concise handoff document instead of a pixel archive.
 
-Powered by [@oh-my-pi/snapcompact](https://github.com/can1357/oh-my-pi/tree/main/packages/snapcompact), the technique behind [Stencil's write-up](https://stencil.so/blog/snapcompact). The rendering is local and deterministic: no extra LLM call, no API key, no latency beyond rasterization.
+Switch modes at any time with `/compact-mode`.
 
 ## Requirements
 
@@ -48,6 +49,18 @@ Frame shapes are provider-aware and selected from SQuAD recall evals:
 | Google | `8on22-bw` @2048px | Extra line spacing; Gemini bills fixed per-image budget |
 | OpenAI | `8on22-bw` | Same line-spacing win; `detail: "original"` for patch billing |
 | Unknown | `8on22-bw` | Safe default with Anthropic-style billing estimate |
+
+## Modes
+
+The engine ships two compaction strategies. Switch between them live — no restart needed:
+
+```
+/compact-mode                  # show current mode
+/compact-mode snapcompact      # bitmap-frame archive (default)
+/compact-mode summarize        # LLM prose summary
+```
+
+Both modes use the same message protection rules (`protect_first_n` / `protect_last_n`) and trigger at the same threshold.
 
 ## Configuration
 
