@@ -17,7 +17,7 @@ hermes plugins install vimona3ds/hermes-snapcompact --enable
 cd ~/.hermes/plugins/hermes-snapcompact/bridge && bun install
 ```
 
-Restart Hermes. The plugin auto-configures itself — your existing compaction behavior is unchanged until you opt in. The plugin never installs anything itself: if Bun or the bridge dependencies are missing, it flags the exact fix at startup and in `/compact-mode`, and compaction keeps working in summarize mode.
+Restart Hermes. Compaction stays on your existing summarize behavior until you opt in. If Bun or the bridge dependencies are missing, startup and `/compact-mode` print the exact fix — the plugin never installs anything itself.
 
 ## Usage
 
@@ -27,7 +27,7 @@ Restart Hermes. The plugin auto-configures itself — your existing compaction b
 /compact-mode summarize        # switch back to LLM prose summary
 ```
 
-The default mode is `summarize` (LLM prose summaries). When you switch to `snapcompact`, old turns are rendered into dense PNG frames instead. Switch back any time; the choice applies to active conversations in that Hermes process. It is saved atomically to `$HERMES_HOME/plugin-data/hermes-snapcompact/mode.yaml` and restored in newly started processes. If saving fails, `/compact-mode` warns you. If the bridge is unavailable at startup, the saved `snapcompact` preference is temporarily suspended in favor of summaries; restart after repairing the bridge, or select `snapcompact` again.
+Default is `summarize`. Your choice is saved to `$HERMES_HOME/plugin-data/hermes-snapcompact/mode.yaml` and restored on restart. If the bridge is broken at startup, a saved `snapcompact` preference is suspended (summaries are used) until you repair the bridge and restart or re-select it.
 
 ## How it works
 
@@ -46,13 +46,13 @@ Frame shapes are provider-aware and selected from SQuAD recall evals:
 
 ## Caveats
 
-- **Vision required.** Non-vision models can't read the bitmap frames. The engine will still work (text edges are preserved verbatim) but middle history will be opaque.
-- **Bun dependency.** The native renderer in @oh-my-pi/snapcompact requires Bun. The plugin only detects and flags a missing setup — it never installs anything.
-- **Image token billing.** While input tokens drop ~3x, models spend extra output/thinking tokens decoding the images. The technique shines at 100k+ token sessions.
-- **Not a lossless backup.** Long tool results and arguments are intentionally truncated; rendering normalizes whitespace and may replace unsupported characters. Keep original files and session history for exact recovery.
-- **Restarted archives.** During one running session, either mode can replace its previous archive. After a process restart, existing image archives are kept verbatim because their source text is no longer in memory. Switching to `summarize` does not retroactively decode those older images.
-- **Safety before savings.** Images and unsupported content blocks are kept with their surrounding prefix, and tool calls stay with their results. If frames would exceed the 80-frame budget, rendering fails without replacing the conversation. If a candidate would not shrink the rough token estimate, the conversation stays unchanged.
-- **Summary fallback.** If the summary model fails or is unavailable, the plugin attempts local bitmap compaction when the bridge is ready. This is logged and still requires a vision-capable conversation model.
+- **Vision required.** Non-vision models can't read the frames; middle history becomes opaque (text edges stay verbatim).
+- **Lossy by design.** Long tool output is truncated and whitespace normalized. Keep files and session history for exact recovery.
+- **Bun required** for the native renderer. Missing setup is detected and flagged, never auto-installed.
+- **Best at scale.** Input tokens drop ~3x, but models spend extra thinking tokens decoding images. Shines past ~100k tokens.
+- **Fails safe.** If frames would exceed the 80-frame budget or wouldn't shrink the context, the conversation is left unchanged. Images and tool-call groups are never split apart.
+- **Old archives persist.** After a restart, existing image archives are kept as-is — their source text is gone, so switching to `summarize` can't retroactively decode them.
+- **Summary fallback.** If the summary model fails, the plugin tries local bitmap compaction instead (logged; still needs a vision model).
 
 ## Verification
 
