@@ -30,7 +30,7 @@ NEWLINE_GLYPH = "\u2588"
 
 _DATA_URL_RE = re.compile(
     r"data:[A-Za-z][\w.+\-]*/[\w.+\-]+(?:;[\w!#$%&'*+.^|~\-]+=[\w!#$%&'*+.^|~\-]+)*"
-    r";base64,[A-Za-z0-9+/=\s]*",
+    r";base64,[A-Za-z0-9+/]*={0,2}",
     re.IGNORECASE,
 )
 
@@ -40,7 +40,7 @@ def _elide_data_urls(text: str) -> str:
     def _repl(m: re.Match[str]) -> str:
         full = m.group(0)
         # Extract mime from between data: and ;base64,
-        semi = full.index(";base64,")
+        semi = full.lower().index(";base64,")
         mime = full[5:semi]
         payload_len = len(full) - semi - 8
         return f"[data URL omitted: {mime}, {payload_len} base64 chars]"

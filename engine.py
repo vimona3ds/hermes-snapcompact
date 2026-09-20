@@ -2,9 +2,8 @@
 
 Dual-mode context engine:
 
-- **summarize** (default) — LLM prose summary, same behavior as the
-  built-in compressor.  Installing the plugin changes nothing until you
-  opt in.
+- **summarize** (default) — LLM prose summary. Installing the plugin
+  keeps summarization as the default until you opt in.
 - **snapcompact** — local, deterministic bitmap-frame archival via
   @oh-my-pi/snapcompact.  Vision models read the frames back at ~1/3
   the input token cost.
@@ -18,8 +17,9 @@ import json
 import logging
 import os
 import subprocess
-import sys
+import tempfile
 import textwrap
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +83,135 @@ def _call_bridge(request: dict[str, Any], *, timeout: float = 120) -> dict[str, 
     return json.loads(result.stdout)
 
 
+# -- Mode persistence ---------------------------------------------------------
+
+VALID_MODES = ("snapcompact", "summarize")
+
+
+def _mode_state_path() -> Path:
+    """Persisted mode file in the per-plugin data dir.
+
+    NOT the install dir — ``<HERMES_HOME>/plugins/<name>/`` is deleted by
+    ``plugins remove`` and git-pulled by ``update`` (see plugin_storage.py).
+    """
+    try:
+        # Hermes host API: <HERMES_HOME>/plugin-data/<name>/, profile-aware.
+        from plugins.plugin_storage import plugin_data_dir
+
+        return plugin_data_dir("hermes-snapcompact") / "mode.yaml"
+    except Exception:
+        home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+        return Path(home) / "plugin-data" / "hermes-snapcompact" / "mode.yaml"
+
+
+def _load_persisted_mode() -> str | None:
+    """Read the persisted mode, or None when missing/invalid/unreadable."""
+    path = _mode_state_path()
+    try:
+        import yaml  # PyYAML — always available in Hermes
+
+        if not path.is_file():
+            return None
+        data = yaml.safe_load(path.read_text())
+        mode = data.get("mode") if isinstance(data, dict) else None
+        if mode in VALID_MODES:
+            return mode
+        logger.warning(
+            "snapcompact: ignoring invalid persisted mode %r in %s", mode, path,
+        )
+    except Exception:
+        logger.debug(
+            "snapcompact: could not read persisted mode from %s", path,
+            exc_info=True,
+        )
+    return None
+
+
+def _persist_mode(mode: str) -> bool:
+    """Atomically save the preference; preserve the old file on failure."""
+    path = _mode_state_path()
+    temporary: str | None = None
+    try:
+        import yaml
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".mode-", delete=False,
+        ) as stream:
+            temporary = stream.name
+            yaml.safe_dump({"mode": mode}, stream, default_flow_style=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        return True
+    except Exception:
+        logger.warning(
+            "snapcompact: could not persist mode %r to %s; "
+            "the choice will not survive a gateway restart.",
+            mode, path, exc_info=True,
+        )
+        return False
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
+class _ModePreference:
+    """Share the selected mode, not conversation state, across host clones."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _ModePreference:
+        return self
+
+
+def _estimate_tokens_rough(messages: list[dict[str, Any]]) -> int:
+    """Rough token estimate matching the host's commit-site anti-growth guard.
+
+    Prefer the host's own estimator (flat learned per-image price, not base64
+    length) so our prediction agrees with the verdict the host reaches in
+    conversation_compression's commit site; fall back to a local
+    approximation when running outside Hermes.
+    """
+    try:
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        return estimate_messages_tokens_rough(messages)
+    except Exception:
+        tokens = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                tokens += len(content) // 4
+                continue
+            for block in content or []:
+                if block.get("type") == "image_url":
+                    tokens += 1600  # flat pre-calibration per-image default
+                else:
+                    tokens += len(str(block.get("text", ""))) // 4
+        return tokens
+
+
+def _msg_text_signature(msg: dict[str, Any]) -> str:
+    """Stable identity for an engine-emitted archive/summary message.
+
+    Role plus the concatenated text blocks — image payloads excluded so the
+    signature survives any host-side image re-encoding.
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "\u0000".join(
+            str(b.get("text", "")) for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    else:
+        text = ""
+    return f"{msg.get('role', '')}\u0000{text}"
+
+
 # -- Summary prompt -----------------------------------------------------------
 
 _SUMMARY_TEMPLATE = textwrap.dedent("""\
@@ -97,7 +226,6 @@ _SUMMARY_TEMPLATE = textwrap.dedent("""\
     Reading HISTORY:
     - Plain text: verbatim transcript; rely on it exactly.
     {image_guide}\
-    {truncation_note}\
     - If an exact earlier detail matters and a section is unclear, re-derive \
     from workspace (re-read files, re-run commands), rather than guess.
 
@@ -138,9 +266,10 @@ class SnapcompactEngine(ContextEngine):
         self.context_length = context_length
         self.threshold_tokens = int(context_length * self.threshold_percent)
 
-        # "summarize" by default — identical to the built-in compressor.
-        # "/compact-mode snapcompact" opts in to bitmap rendering.
-        self.mode: str = "summarize"
+        # Keep LLM prose summarization as the default until the user opts in.
+        # "/compact-mode snapcompact" opts in to bitmap rendering; the
+        # choice is persisted under HERMES_HOME and restored on restart.
+        self._mode_preference = _ModePreference(_load_persisted_mode() or "summarize")
 
         # Plugin LLM access — set via set_llm() from register().
         self._llm: object | None = None
@@ -150,14 +279,30 @@ class SnapcompactEngine(ContextEngine):
         self._provider: str = ""
         self._api_mode: str = ""
         self._archive_text: str = ""
-        self._truncated_chars: int = 0
-        self._previous_summary: str = ""
+        # Keep the accepted artifact and its proposed replacement until the
+        # next transcript tells us which one the host actually committed.
+        self._archive_states: dict[str, tuple[str, str]] = {}
 
         self._bridge_checked = False
+
+    @property
+    def mode(self) -> str:
+        return self._mode_preference.value
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        self._mode_preference.value = value
 
     def set_llm(self, llm: object | None) -> None:
         """Inject plugin LLM access handle (called by register)."""
         self._llm = llm
+
+    def set_mode(self, mode: str) -> bool:
+        """Switch live mode; return whether the preference was saved."""
+        if mode not in VALID_MODES:
+            raise ValueError(f"unknown compaction mode: {mode!r}")
+        self.mode = mode
+        return _persist_mode(mode)
 
     # -- Core interface -------------------------------------------------------
 
@@ -200,16 +345,9 @@ class SnapcompactEngine(ContextEngine):
         """Compact via bitmap-frame rendering."""
         self._ensure_bridge()
 
-        # Identify which messages to archive vs keep.
-        # Strategy: protect system prompt + first N + last N messages.
-        system_msgs, conversation = self._split_system(messages)
-        if len(conversation) <= self.protect_first_n + self.protect_last_n:
-            return messages  # Nothing to compress
-
-        keep_head = conversation[: self.protect_first_n]
-        keep_tail = conversation[-self.protect_last_n :]
-        to_archive = conversation[self.protect_first_n : -self.protect_last_n]
-
+        system_msgs, keep_head, to_archive, keep_tail, archive_text, previous_summary = (
+            self._prepare_history(messages)
+        )
         if not to_archive:
             return messages
 
@@ -225,17 +363,18 @@ class SnapcompactEngine(ContextEngine):
         if not serialized.strip():
             return messages
 
-        # Build the accumulated archive source: previous archive + new text.
-        if self._archive_text:
-            archive_source = f"{self._archive_text}{NEWLINE_GLYPH}{serialized}"
-        elif self._previous_summary:
-            # Carry forward a text-based summary from the built-in compressor.
-            archive_source = (
-                f"[Summary of earlier history] {self._previous_summary}"
-                f" [Recent conversation] {serialized}"
+        # Only carry history whose artifact is present in the actual input.
+        # A proposed replacement may have been rejected by the host.
+        if archive_text:
+            base = f"{archive_text}{NEWLINE_GLYPH}"
+        elif previous_summary:
+            base = (
+                f"[Summary of earlier history] {previous_summary}"
+                f" [Recent conversation] "
             )
         else:
-            archive_source = serialized
+            base = ""
+        archive_source = base + serialized
 
         # Determine shape target for the renderer.
         shape_target: dict[str, str] = {}
@@ -265,9 +404,6 @@ class SnapcompactEngine(ContextEngine):
         shape = response.get("shape", {})
         geo = response.get("geometry", {})
 
-        # Persist archive source for re-rendering on next compaction.
-        self._archive_text = archive_source
-        self.compression_count += 1
 
         # Build the summary message with reading guide.
         cols = geo.get("cols", "?")
@@ -277,21 +413,13 @@ class SnapcompactEngine(ContextEngine):
         if images:
             image_guide = _IMAGE_GUIDE_TEMPLATE.format(cols=cols, rows=rows)
 
-        truncation_note = ""
-        if self._truncated_chars > 0:
-            truncation_note = (
-                f"- About {self._truncated_chars} characters of older middle "
-                f"history dropped to fit archive budget.\n"
-            )
-
         summary_text = _SUMMARY_TEMPLATE.format(
             image_guide=image_guide,
-            truncation_note=truncation_note,
         )
 
         # Construct the summary content blocks: text guide + image frames.
         content_blocks: list[dict[str, Any]] = [
-            {"type": "text", "text": summary_text},
+            {"type": "text", "text": f"[snapcompact:{uuid.uuid4().hex}]\n{summary_text}"},
         ]
         for img in images:
             data = img.get("data", "")
@@ -308,8 +436,10 @@ class SnapcompactEngine(ContextEngine):
         # Also append the archive source as a trailing text block (head+tail)
         # so models always have verbatim text at the chronological edges.
         if len(archive_source) > 0:
-            frame_capacity = geo.get("capacity", 10000)
-            text_edge = min(frame_capacity, len(archive_source) // 3)
+            # Small verbatim anchors only — these are orientation aids, not
+            # backup storage. len//3 per side re-included 2/3 of the archive
+            # as text and made small compactions grow the transcript.
+            text_edge = min(2000, len(archive_source) // 6)
             if text_edge > 0 and len(archive_source) > text_edge * 2:
                 text_head = archive_source[:text_edge]
                 text_tail = archive_source[-text_edge:]
@@ -339,20 +469,98 @@ class SnapcompactEngine(ContextEngine):
         # Build the compressed message list.
         result = list(system_msgs) + [summary_msg] + list(keep_head) + list(keep_tail)
 
+        # Self-check with the host's own anti-growth arithmetic: below a
+        # certain archive size, the flat per-image price plus guide/edge
+        # overhead exceeds what the frames remove, and the host would refuse
+        # the commit anyway (user-facing warning + an ineffective-compaction
+        # strike). Bow out cleanly instead, mutating no engine state.
+        rough_in = _estimate_tokens_rough(messages)
+        rough_out = _estimate_tokens_rough(result)
+        if rough_out >= rough_in:
+            logger.info(
+                "snapcompact: rendering would not shrink the transcript "
+                "(~%d -> ~%d tokens) — archive too small to amortize frame "
+                "overhead; leaving transcript unchanged",
+                rough_in, rough_out,
+            )
+            return messages
+
+        # This is a proposal, not a host commit. Retain the prior state until
+        # a later input contains this exact artifact instead of its predecessor.
+        self._archive_states[_msg_text_signature(summary_msg)] = (archive_source, "")
+        self.compression_count += 1
+
         # Reset prompt token tracking — the host will re-measure after the
         # compressed request goes out.
         self.last_prompt_tokens = -1
 
-        frame_chars = sum(img.get("chars", 0) for img in images) if images else 0
-        total_chars = frame_chars + len(archive_source)
         logger.info(
-            "snapcompact: archived %d chars onto %d frame(s), compression #%d",
-            total_chars, len(images), self.compression_count,
+            "snapcompact: archived %d chars onto %d frame(s) (~%d -> ~%d "
+            "tokens), compression #%d",
+            len(archive_source), len(images), rough_in, rough_out,
+            self.compression_count,
         )
 
         return result
 
     # -- Summarize mode -------------------------------------------------------
+
+    def _prepare_history(
+        self, messages: list[dict[str, Any]],
+    ) -> tuple[
+        list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
+        list[dict[str, Any]], str, str,
+    ]:
+        """Reconcile proposals against the transcript and choose a safe slice."""
+        system, conversation = self._split_system(messages)
+        archive_text, previous_summary = "", ""
+        retained_states = {}
+        for index, message in enumerate(conversation):
+            key = _msg_text_signature(message)
+            if key in self._archive_states:
+                archive_text, previous_summary = self._archive_states[key]
+                retained_states[key] = (archive_text, previous_summary)
+                conversation = conversation[:index] + conversation[index + 1:]
+                break
+        self._archive_states = retained_states
+        self._archive_text = archive_text
+
+        start = self.protect_first_n
+        end = max(0, len(conversation) - self.protect_last_n)
+        # A text serializer cannot preserve pictures, audio, or unknown blocks.
+        # Protect the prefix through them, including archives from past processes.
+        for index, message in enumerate(conversation[:end]):
+            content = message.get("content")
+            if message.get("role") not in ("user", "assistant", "tool") or (
+                isinstance(content, list) and any(
+                    not isinstance(block, dict) or block.get("type") not in ("text", "thinking")
+                    for block in content
+                )
+            ):
+                start = max(start, index + 1)
+
+        # Never leave a tool result without its call (or a call without results).
+        calls = {}
+        spans = {}
+        for index, message in enumerate(conversation):
+            for call in message.get("tool_calls") or []:
+                calls[call.get("id")] = index
+            if message.get("role") == "tool":
+                call_index = calls.get(message.get("tool_call_id"))
+                if call_index is not None:
+                    spans[call_index] = index
+        for left, right in sorted(spans.items()):
+            if left < start <= right:
+                start = right + 1
+        for left, right in sorted(spans.items(), reverse=True):
+            if left < end <= right:
+                end = left
+        if start >= end:
+            return system, conversation, [], [], archive_text, previous_summary
+        return (
+            system, conversation[:start], conversation[start:end], conversation[end:],
+            archive_text, previous_summary,
+        )
 
     def _compress_summarize(
         self,
@@ -363,13 +571,9 @@ class SnapcompactEngine(ContextEngine):
         memory_context: str = "",
     ) -> list[dict[str, Any]]:
         """Compact via LLM prose summary."""
-        system_msgs, conversation = self._split_system(messages)
-        if len(conversation) <= self.protect_first_n + self.protect_last_n:
-            return messages
-
-        keep_head = conversation[: self.protect_first_n]
-        keep_tail = conversation[-self.protect_last_n :]
-        to_archive = conversation[self.protect_first_n : -self.protect_last_n]
+        system_msgs, keep_head, to_archive, keep_tail, archive_text, previous_summary = (
+            self._prepare_history(messages)
+        )
         if not to_archive:
             return messages
 
@@ -377,6 +581,14 @@ class SnapcompactEngine(ContextEngine):
         serialized = serialize_messages(to_archive, include_thinking=not is_anthropic)
         if not serialized.strip():
             return messages
+
+        # Fold prior engine state into the summary input so a mode switch
+        # never strands history: frame-archive text (its message was dropped
+        # above and only existed as pixels) and any earlier prose summary.
+        if archive_text:
+            serialized = f"[Archived earlier history]\n{archive_text}\n\n[Newer conversation]\n{serialized}"
+        if previous_summary:
+            serialized = f"[Earlier summary]\n{previous_summary}\n\n{serialized}"
 
         if self._llm is None:
             ok, detail = self.ensure_ready()
@@ -398,7 +610,11 @@ class SnapcompactEngine(ContextEngine):
             f"omit actionable specifics.{focus}\n\n{serialized}"
         )
         try:
-            summary = self._llm.complete(prompt)
+            # Host contract: PluginLlm.complete(messages) -> result with .text.
+            completion = self._llm.complete([{"role": "user", "content": prompt}])
+            summary = getattr(completion, "text", "") or ""
+            if not summary.strip():
+                raise RuntimeError("LLM returned an empty summary")
         except Exception:
             if not self.bridge_ready():
                 raise
@@ -407,30 +623,47 @@ class SnapcompactEngine(ContextEngine):
                 messages, current_tokens, focus_topic, force, memory_context,
             )
 
-        self._previous_summary = summary
-        self.compression_count += 1
-        self.last_prompt_tokens = -1
-
         summary_msg: dict[str, Any] = {
             "role": "user",
-            "content": (
-                "Resume prior conversation. Summary of earlier context:\n\n"
-                + summary
-            ),
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"[snapcompact:{uuid.uuid4().hex}]\n"
+                    "Resume prior conversation. Summary of earlier context:\n\n"
+                    + summary
+                ),
+            }],
         }
         result = list(system_msgs) + [summary_msg] + list(keep_head) + list(keep_tail)
 
+        # Same anti-growth self-check as the snapcompact path: bow out with
+        # no state mutation rather than hand the host a growing transcript.
+        rough_in = _estimate_tokens_rough(messages)
+        rough_out = _estimate_tokens_rough(result)
+        if rough_out >= rough_in:
+            logger.info(
+                "summarize: generated summary would not shrink the transcript "
+                "(~%d -> ~%d tokens); leaving transcript unchanged",
+                rough_in, rough_out,
+            )
+            return messages
+
+        self._archive_states[_msg_text_signature(summary_msg)] = ("", summary)
+        self.compression_count += 1
+        self.last_prompt_tokens = -1
+
         logger.info(
-            "snapcompact(summarize): compressed %d messages into %d-char summary, #%d",
-            len(to_archive), len(summary), self.compression_count,
+            "snapcompact(summarize): compressed %d messages into %d-char summary "
+            "(~%d -> ~%d tokens), #%d",
+            len(to_archive), len(summary), rough_in, rough_out,
+            self.compression_count,
         )
         return result
     # -- Optional overrides ---------------------------------------------------
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
-        self._archive_text = ""
-        self._truncated_chars = 0
-        self._previous_summary = ""
+        if kwargs.get("boundary_reason") != "compression":
+            self.on_session_reset()
 
     def on_session_end(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         pass
@@ -438,8 +671,7 @@ class SnapcompactEngine(ContextEngine):
     def on_session_reset(self) -> None:
         super().on_session_reset()
         self._archive_text = ""
-        self._truncated_chars = 0
-        self._previous_summary = ""
+        self._archive_states = {}
 
     def update_model(
         self,
@@ -463,8 +695,8 @@ class SnapcompactEngine(ContextEngine):
         return status
 
     def has_content_to_compress(self, messages: list[dict[str, Any]]) -> bool:
-        _, conversation = self._split_system(messages)
-        return len(conversation) > self.protect_first_n + self.protect_last_n
+        _, _, to_archive, _, _, _ = self._prepare_history(messages)
+        return bool(to_archive)
 
     # -- Internal helpers -----------------------------------------------------
 

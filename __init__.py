@@ -1,7 +1,6 @@
 """hermes-snapcompact: Snapcompact context engine plugin for Hermes.
 
-Install the plugin, and nothing changes — compaction still uses LLM
-summaries (the built-in default).  When you're ready, type:
+Compaction uses LLM prose summaries by default. When you're ready, type:
 
     /compact-mode snapcompact
 
@@ -14,11 +13,9 @@ import logging
 import os
 import sys
 
-from .engine import SnapcompactEngine
+from .engine import SnapcompactEngine, VALID_MODES
 
 logger = logging.getLogger(__name__)
-
-_VALID_MODES = ("snapcompact", "summarize")
 
 
 def _auto_activate_engine() -> None:
@@ -52,7 +49,7 @@ def _auto_activate_engine() -> None:
                 yaml.safe_dump(config, f, default_flow_style=False)
             logger.info(
                 "snapcompact: set context.engine: snapcompact in %s "
-                "(was %r). Default compaction behavior is unchanged — "
+                "(was %r). LLM summaries remain the default — "
                 "use /compact-mode snapcompact to enable bitmap rendering.",
                 config_path,
                 current,
@@ -84,6 +81,14 @@ def register(ctx):
             f"[snapcompact] compaction still works (summarize mode); "
             f"/compact-mode snapcompact is disabled until fixed."
         )
+        if engine.mode == "snapcompact":
+            # Suspend in-memory only — keep the persisted opt-in so it
+            # comes back automatically once the bridge is fixed.
+            engine.mode = "summarize"
+            notice += (
+                "\n[snapcompact] persisted snapcompact mode suspended "
+                "for this run."
+            )
         print(notice, file=sys.stderr)
         logger.warning(notice)
 
@@ -105,10 +110,10 @@ def register(ctx):
                 f"{bridge_note}"
             )
 
-        if arg not in _VALID_MODES:
+        if arg not in VALID_MODES:
             return (
                 f"Unknown mode `{arg}`. "
-                f"Choose: {', '.join(f'`{m}`' for m in _VALID_MODES)}"
+                f"Choose: {', '.join(f'`{m}`' for m in VALID_MODES)}"
             )
 
         if arg == "snapcompact":
@@ -120,10 +125,14 @@ def register(ctx):
                 )
 
         old = engine.mode
+        saved = engine.set_mode(arg)
+        notice = "" if saved else (
+            "\nWarning: the mode changed for this process, but could not be saved. "
+            "It may revert after restart; check the Hermes log for the filesystem error."
+        )
         if old == arg:
-            return f"Already using `{arg}`."
-        engine.mode = arg
-        return f"Compaction mode: `{old}` → **`{arg}`**."
+            return f"Already using `{arg}`.{notice}"
+        return f"Compaction mode: `{old}` → **`{arg}`**.{notice}"
 
     ctx.register_command(
         "compact-mode",

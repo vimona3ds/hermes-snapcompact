@@ -12,7 +12,6 @@ import {
   renderMany,
   frames,
   geometry,
-  normalize,
   resolveShape,
   resolveShapeForText,
   type ShapeTarget,
@@ -60,6 +59,14 @@ async function main() {
           ? resolveShapeForText(request.text, request.model, request.variant)
           : resolveShape(request.model, request.variant);
         const geo = geometry(shape);
+        const requiredFrames = frames(request.text, { shape });
+        if (request.maxFrames !== undefined &&
+            (!Number.isInteger(request.maxFrames) || request.maxFrames < 1 ||
+             requiredFrames > request.maxFrames)) {
+          throw new Error(
+            `Archive requires ${requiredFrames} frames; limit is ${request.maxFrames}. No history was rendered.`
+          );
+        }
         const images = await renderMany(request.text, {
           shape,
           maxFrames: request.maxFrames,
@@ -111,7 +118,10 @@ async function main() {
       }
 
       case "frames": {
-        const count = frames(request.text, { model: request.model });
+        const shape = request.text
+          ? resolveShapeForText(request.text, request.model, request.variant)
+          : resolveShape(request.model, request.variant);
+        const count = frames(request.text, { shape });
         process.stdout.write(JSON.stringify({ frames: count }));
         break;
       }

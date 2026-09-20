@@ -1,5 +1,5 @@
 name: hermes-snapcompact
-version: "1.0.0"
+version: "1.0.1"
 description: >
   Snapcompact context engine: compress conversation history into dense
   bitmap PNG frames that vision-capable LLMs read back at ~1/3 the token cost.

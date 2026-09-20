@@ -27,7 +27,7 @@ Restart Hermes. The plugin auto-configures itself — your existing compaction b
 /compact-mode summarize        # switch back to LLM prose summary
 ```
 
-The default mode is `summarize` — identical to the built-in compressor. When you switch to `snapcompact`, old turns are rendered into dense PNG frames instead of being summarized by an LLM. Switch back any time.
+The default mode is `summarize` (LLM prose summaries). When you switch to `snapcompact`, old turns are rendered into dense PNG frames instead. Switch back any time; the choice applies to active conversations in that Hermes process. It is saved atomically to `$HERMES_HOME/plugin-data/hermes-snapcompact/mode.yaml` and restored in newly started processes. If saving fails, `/compact-mode` warns you. If the bridge is unavailable at startup, the saved `snapcompact` preference is temporarily suspended in favor of summaries; restart after repairing the bridge, or select `snapcompact` again.
 
 ## How it works
 
@@ -49,6 +49,30 @@ Frame shapes are provider-aware and selected from SQuAD recall evals:
 - **Vision required.** Non-vision models can't read the bitmap frames. The engine will still work (text edges are preserved verbatim) but middle history will be opaque.
 - **Bun dependency.** The native renderer in @oh-my-pi/snapcompact requires Bun. The plugin only detects and flags a missing setup — it never installs anything.
 - **Image token billing.** While input tokens drop ~3x, models spend extra output/thinking tokens decoding the images. The technique shines at 100k+ token sessions.
+- **Not a lossless backup.** Long tool results and arguments are intentionally truncated; rendering normalizes whitespace and may replace unsupported characters. Keep original files and session history for exact recovery.
+- **Restarted archives.** During one running session, either mode can replace its previous archive. After a process restart, existing image archives are kept verbatim because their source text is no longer in memory. Switching to `summarize` does not retroactively decode those older images.
+- **Safety before savings.** Images and unsupported content blocks are kept with their surrounding prefix, and tool calls stay with their results. If frames would exceed the 80-frame budget, rendering fails without replacing the conversation. If a candidate would not shrink the rough token estimate, the conversation stays unchanged.
+- **Summary fallback.** If the summary model fails or is unavailable, the plugin attempts local bitmap compaction when the bridge is ready. This is logged and still requires a vision-capable conversation model.
+
+## Verification
+
+Tested against Hermes v0.21.3, Bun, and the installed snapcompact renderer on macOS. Other provider APIs and operating systems have not been verified end-to-end here.
+
+Run the regression checks using the Python environment from your Hermes installation:
+
+```bash
+PYTHONPATH=/path/to/hermes-agent /path/to/hermes-agent/venv/bin/python -m unittest discover -s tests -v
+```
+
+Renderer tests require Bun and `bridge/node_modules`; they skip if dependencies are absent. To use an existing renderer installation without installing again, set `SNAPCOMPACT_NODE_MODULES` to its absolute `node_modules` path. Tests use temporary Hermes homes and do not call a live model.
+
+## Changes in 1.0.1
+
+- Persist the selected mode outside the plugin installation directory, and apply mode changes to active host-created engine copies.
+- Reconcile compression proposals with the actual transcript so rejected attempts do not duplicate or replace accepted history.
+- Retain archive state at Hermes compression boundaries; support switching between frame archives and summaries.
+- Keep pre-restart images and complete tool-call groups rather than silently dropping their contents.
+- Fix the Hermes summary API call, reject frame-budget overflow, and preserve ordinary text following embedded data URLs.
 
 ## License
 
