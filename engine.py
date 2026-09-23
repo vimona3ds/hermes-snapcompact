@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -212,11 +213,37 @@ def _msg_text_signature(msg: dict[str, Any]) -> str:
     return f"{msg.get('role', '')}\u0000{text}"
 
 
+def _message_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(block.get("text", "")) for block in content
+                         if isinstance(block, dict) and block.get("type") == "text")
+    return ""
+
+
+def _is_archive_message(message: dict[str, Any]) -> bool:
+    text = re.sub(r"^\[snapcompact:[0-9a-f]{32}\]\n", "", _message_text(message), count=1)
+    return message.get("role") == "user" and text.startswith((
+        "Resume prior conversation. Earlier turns archived under HISTORY below,",
+        "Resume prior conversation. Summary of earlier context:",
+    ))
+
+
+def _is_task_request(message: dict[str, Any]) -> bool:
+    return (message.get("role") == "user" and not _is_archive_message(message)
+            and message.get("display_kind") != "steer"
+            and not _message_text(message).lstrip().startswith("[OUT-OF-BAND USER MESSAGE"))
+
+
 # -- Summary prompt -----------------------------------------------------------
 
 _SUMMARY_TEMPLATE = textwrap.dedent("""\
     Resume prior conversation. Earlier turns archived under HISTORY below, \
-    oldest→newest. Read HISTORY fully; continue the live conversation following it.
+    oldest→newest. Treat HISTORY and earlier messages as background reference. \
+    Continue the live user request following HISTORY and its later corrections; \
+    do not reopen completed earlier tasks.
 
     Archived transcript scopes:
     - `¶user:`, `¶think:`, `¶ai:`, `¶call:`: user, assistant reasoning, assistant reply, tool call.
@@ -467,7 +494,7 @@ class SnapcompactEngine(ContextEngine):
         }
 
         # Build the compressed message list.
-        result = list(system_msgs) + [summary_msg] + list(keep_head) + list(keep_tail)
+        result = list(system_msgs) + list(keep_head) + [summary_msg] + list(keep_tail)
 
         # Self-check with the host's own anti-growth arithmetic: below a
         # certain archive size, the flat per-image price plus guide/edge
@@ -525,8 +552,30 @@ class SnapcompactEngine(ContextEngine):
         self._archive_states = retained_states
         self._archive_text = archive_text
 
+        # Older releases emitted archive -> protected head -> tail. A resumed
+        # artifact has no local state, so retain its blocks but restore head ->
+        # archive order before selecting a new middle. Keep head tool groups whole.
+        if conversation and _is_archive_message(conversation[0]):
+            archive, following = conversation[0], conversation[1:]
+            boundary = min(self.protect_first_n, len(following))
+            pending = set()
+            for index, message in enumerate(following):
+                if index >= boundary and not pending:
+                    break
+                pending.update(call.get("id") for call in message.get("tool_calls") or [])
+                if message.get("role") == "tool":
+                    pending.discard(message.get("tool_call_id"))
+                boundary = max(boundary, index + 1)
+            conversation = following[:boundary] + [archive] + following[boundary:]
+
         start = self.protect_first_n
         end = max(0, len(conversation) - self.protect_last_n)
+        # Row counts alone can retire the task while leaving only its tool results
+        # and a later steer live. Keep the entire latest ordinary user turn.
+        for index in range(len(conversation) - 1, -1, -1):
+            if _is_task_request(conversation[index]):
+                end = min(end, index)
+                break
         # A text serializer cannot preserve pictures, audio, or unknown blocks.
         # Protect the prefix through them, including archives from past processes.
         for index, message in enumerate(conversation[:end]):
@@ -629,12 +678,14 @@ class SnapcompactEngine(ContextEngine):
                 "type": "text",
                 "text": (
                     f"[snapcompact:{uuid.uuid4().hex}]\n"
-                    "Resume prior conversation. Summary of earlier context:\n\n"
+                    "Resume prior conversation. Summary of earlier context:\n"
+                    "Background reference only; continue the live user request below "
+                    "and its later corrections, not completed earlier tasks.\n\n"
                     + summary
                 ),
             }],
         }
-        result = list(system_msgs) + [summary_msg] + list(keep_head) + list(keep_tail)
+        result = list(system_msgs) + list(keep_head) + [summary_msg] + list(keep_tail)
 
         # Same anti-growth self-check as the snapcompact path: bow out with
         # no state mutation rather than hand the host a growing transcript.
