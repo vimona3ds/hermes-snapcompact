@@ -26,7 +26,11 @@ Your choice persists across restarts.
 - Non-vision models can't read the frames.
 - Lossy: long tool output is truncated. Keep originals for exact recovery.
 - Pays off most in long sessions (~100k+ tokens).
-- Fails safe: if archiving wouldn't shrink the context, nothing changes.
+- Successful compaction preserves chronological order: opening messages, archived
+  history, then the live user request and its later corrections. The entire latest
+  task turn stays live.
+- Fails safe: with no older middle to archive or no token savings, the original
+  transcript stays unchanged, including any legacy archive-before-opening layout.
 
 ## Development
 
