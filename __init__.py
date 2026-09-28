@@ -67,13 +67,18 @@ def register(ctx):
     """Called by Hermes plugin discovery."""
     engine = SnapcompactEngine()
     engine.set_llm(getattr(ctx, "llm", None))
-    # plugins.entries.hermes-snapcompact.settings.frame_image_tokens in config.yaml
+    # plugins.entries.hermes-snapcompact.settings.* in the profile's config.yaml.
+    # Only plain values reach the engine; it never keeps ctx.
     get_config = getattr(ctx, "get_config", None)
     if callable(get_config):
         try:
             engine.set_frame_image_tokens(get_config("frame_image_tokens", DEFAULT_FRAME_IMAGE_TOKENS))
         except Exception:
             logger.warning("snapcompact: could not read frame_image_tokens; using the default", exc_info=True)
+        try:
+            engine.set_summary_prompt_file(get_config("summary_prompt_file", ""))
+        except Exception:
+            logger.warning("snapcompact: could not read summary_prompt_file; using the built-in prompt", exc_info=True)
     ctx.register_context_engine(engine)
 
     _auto_activate_engine()

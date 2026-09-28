@@ -29,6 +29,7 @@ Your choice persists across restarts.
 - Fails safe: if archiving wouldn't shrink the context, nothing changes.
 - One rolling summary: each compaction folds earlier summaries and frame archives into the new one, also after a restart. Old frame archives are read as images if the model takes images; otherwise the summary says their middle is missing.
 - Frame images cost more than Hermes estimates. The plugin prices each at `frame_image_tokens` (default 2500); override in `config.yaml` under `plugins.entries.hermes-snapcompact.settings`.
+- Your own summary prompt: set `summary_prompt_file: /path/to/prompt.md` in the same place (per profile). It replaces the built-in instructions and is re-read at every compaction; if it can't be read, the built-in prompt is used and a warning is logged. The summarizer also sees a short (≤ 4 KB) digest of the recent turns kept after the summary, so it doesn't repeat them or call them unanswered.
 
 ## Development
 

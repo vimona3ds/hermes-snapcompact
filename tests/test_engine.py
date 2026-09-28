@@ -375,6 +375,100 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(artifacts(out)), 1)
         assert_tool_pairs_intact(self, out)
 
+    # -- Summary prompt file and the kept-tail digest -----------------------------
+
+    def prompt_file(self, text):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "compact-prompt.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def assert_one_summary(self, out):
+        self.assertEqual(len(artifacts(out)), 1)
+        self.assertIn(engine_module._SUMMARY_HEADER, text_of(out[1]))
+
+    def test_prompt_file_is_read_at_every_compaction(self):
+        path = self.prompt_file("PROMPT_V1: write Ada's handoff.\n")
+        engine = self.summarizer()
+        engine.set_summary_prompt_file(str(path))
+        out = engine.compress(history())
+        self.assertTrue(self.prompts[-1].startswith("PROMPT_V1"))
+        self.assertNotIn(engine_module._BUILTIN_INTRO, self.prompts[-1])
+        self.assert_one_summary(out)
+        # An edit applies at the next compaction, with no new engine.
+        path.write_text("PROMPT_V2: write Ada's handoff.\n", encoding="utf-8")
+        out = engine.compress(extend(out))
+        prompt = self.prompts[-1]
+        self.assertTrue(prompt.startswith("PROMPT_V2"))
+        self.assertNotIn("PROMPT_V1", prompt)
+        # The merge rule still follows the file's text, then the earlier summary.
+        self.assertLess(prompt.index("Merge them"), prompt.index("[Earlier summary]\n"))
+        self.assert_one_summary(out)
+        self.assertIn("Recorded facts: FIRST_5, NEXT_5", text_of(out[1]))
+
+    def test_missing_or_empty_prompt_file_falls_back_to_the_built_in_prompt(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        empty = Path(folder.name) / "empty.md"
+        empty.write_text("  \n", encoding="utf-8")
+        for path in (Path(folder.name) / "missing.md", empty, Path(folder.name)):
+            with self.subTest(path=path.name):
+                engine = self.summarizer()
+                engine.set_summary_prompt_file(str(path))
+                with self.assertLogs(engine_module.logger, level="WARNING"):
+                    out = engine.compress(history())
+                self.assertTrue(self.prompts[-1].startswith(engine_module._BUILTIN_INTRO))
+                self.assert_one_summary(out)
+
+    def test_prompt_file_removed_between_compactions_falls_back(self):
+        path = self.prompt_file("PROMPT_V1: write Ada's handoff.\n")
+        engine = self.summarizer()
+        engine.set_summary_prompt_file(str(path))
+        out = engine.compress(history())
+        path.unlink()
+        with self.assertLogs(engine_module.logger, level="WARNING"):
+            out = engine.compress(extend(out))
+        self.assertTrue(self.prompts[-1].startswith(engine_module._BUILTIN_INTRO))
+        self.assert_one_summary(out)
+
+    def test_summarizer_sees_a_bounded_digest_of_the_kept_tail(self):
+        big = {"role": "tool", "tool_call_id": "big", "content": "BIG_RESULT " + "x" * 100_000}
+        source = history() + [
+            tool_call("big"), big,
+            {"role": "assistant", "content": "ANSWER_SENT " + "Here is today's plan. " * 100},
+            {"role": "user", "content": "LATEST_ASK"},
+        ]
+        out = self.summarizer().compress(source)
+        self.assert_one_summary(out)
+        self.assertEqual(out[-6:], source[-6:])  # the tail itself stays verbatim
+        prompt = self.prompts[-1]
+        mark = "[Kept verbatim after your summary: do not summarize or repeat]"
+        self.assertEqual(prompt.count(mark), 1)
+        digest = prompt[prompt.index(mark):]
+        self.assertLessEqual(len(digest.encode("utf-8")), 4096)
+        self.assertNotIn("BIG_RESULT", prompt)
+        rows = digest.splitlines()[1:]
+        self.assertIn(f"tool place_proposal ({len(big['content'])} chars)", rows)
+        self.assertIn("user: LATEST_ASK", rows)
+        self.assertTrue(any(row.startswith("assistant: ANSWER_SENT") for row in rows))
+        for row in rows:
+            role, _, text = row.partition(": ")
+            if role in ("user", "assistant"):
+                self.assertLessEqual(len(text), 300)
+        # The archived slice is still summarized in full, before the digest.
+        self.assertLess(prompt.index("FIRST_5:"), prompt.index(mark))
+
+    def test_tail_digest_stays_under_4_kb_however_long_the_tail(self):
+        tail = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"TURN_{i} " + "é" * 5_000}
+                for i in range(40)]
+        digest = engine_module._tail_digest(tail)
+        self.assertLessEqual(len(digest.encode("utf-8")), 4096)
+        self.assertIn("TURN_0 ", digest)
+        self.assertNotIn("TURN_39 ", digest)
+        self.assertRegex(digest.splitlines()[-1], r"^\(\d+ more kept messages not shown\)$")
+        self.assertEqual(engine_module._tail_digest([]), "")
+
     # -- Frame image price ------------------------------------------------------
 
     def test_preflight_counts_frame_pages_at_their_real_price(self):
@@ -462,6 +556,17 @@ class PersistenceTests(unittest.TestCase):
         with self.assertLogs(engine_module.logger, level="WARNING"):
             engine, _ = self.register(settings={"frame_image_tokens": "lots"})
         self.assertEqual(engine.frame_image_tokens, engine_module.DEFAULT_FRAME_IMAGE_TOKENS)
+
+    def test_summary_prompt_file_comes_from_plugin_settings(self):
+        engine, _ = self.register()
+        self.assertEqual(engine.summary_prompt_file, "")
+        engine, _ = self.register(settings={"summary_prompt_file": "/srv/prompts/ada.md"})
+        self.assertEqual(engine.summary_prompt_file, "/srv/prompts/ada.md")
+        # Host clones (one per agent) keep the path, not a handle to ctx.
+        self.assertEqual(copy.deepcopy(engine).summary_prompt_file, "/srv/prompts/ada.md")
+        with self.assertLogs(engine_module.logger, level="WARNING"):
+            engine, _ = self.register(settings={"summary_prompt_file": ["not", "a", "path"]})
+        self.assertEqual(engine.summary_prompt_file, "")
 
     def test_unavailable_bridge_preserves_opt_in_until_repaired(self):
         engine_module.SnapcompactEngine().set_mode("snapcompact")
