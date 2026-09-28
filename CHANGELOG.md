@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.0
+
+- Per-profile summary prompt: setting `plugins.entries.hermes-snapcompact.settings.summary_prompt_file` names a text file used as the summarizer's instructions instead of the built-in ones. The file is read at every compaction, so edits apply without a restart; if it is missing, unreadable or empty, a warning is logged and the built-in prompt is used. The merge rule for earlier summaries, the `[snapcompact:gap]` lines and the "Resume prior conversation" header are unchanged.
+- The summarizer also sees a read-only digest of the recent turns kept verbatim after the summary (`[Kept verbatim after your summary: do not summarize or repeat]`): user and assistant text up to 300 characters each, tool results as `tool <name> (N chars)`, at most 4 KB in all. Before, it could not see an answer that sat in those turns and called the request unanswered.
+
 ## 1.1.0
 
 - Fold, never pin: each compaction merges every earlier summary and frame archive into one rolling summary. 1.0.x kept everything before any image-bearing message, so frame archives and every summary stacked in front of them stayed in context for good.

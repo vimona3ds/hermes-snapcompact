@@ -335,6 +335,78 @@ _IMAGE_GUIDE_TEMPLATE = textwrap.dedent("""\
     left→right, top→bottom. No word wrap; words may break across rows.
     """)
 
+# Built-in summarizer intro, used when no summary_prompt_file is set or it
+# cannot be read.
+_BUILTIN_INTRO = (
+    "Summarize the following conversation history into a concise but "
+    "complete handoff document. Preserve key decisions, file paths, "
+    "code changes, error details, and current task state. Do NOT "
+    "omit actionable specifics."
+)
+
+# The kept tail stays verbatim after the summary. The summarizer sees a short
+# digest of it, so it does not call a thing unanswered only because the answer
+# sits in the tail. Bounded: a large tool result in the tail must not blow up
+# the summary request.
+_TAIL_MARK = "[Kept verbatim after your summary: do not summarize or repeat]"
+_TAIL_TEXT_CHARS = 300
+_TAIL_DIGEST_BYTES = 4096
+
+
+def _plain_text(content: Any) -> str:
+    """Text of a message's content; other blocks (images, thinking) skipped."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(b.get("text", "")) for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def _tail_digest(tail: list[dict[str, Any]]) -> str:
+    """A read-only digest of the kept tail, at most _TAIL_DIGEST_BYTES (UTF-8).
+
+    User and assistant text is cut to _TAIL_TEXT_CHARS each, on one line;
+    tool results become ``tool <name> (N chars)``. Rows that would pass the
+    byte limit are dropped and counted in a last line. Empty when there is
+    nothing to show.
+    """
+    names = {
+        call.get("id"): (call.get("function") or {}).get("name") or "?"
+        for message in tail for call in message.get("tool_calls") or []
+        if isinstance(call, dict)
+    }
+    rows: list[str] = []
+    for message in tail:
+        role = message.get("role")
+        text = _plain_text(message.get("content"))
+        if role == "tool":
+            name = names.get(message.get("tool_call_id")) or message.get("name") or "?"
+            rows.append(f"tool {name} ({len(text)} chars)")
+        elif role in ("user", "assistant"):
+            line = " ".join(text.split())
+            if not line:
+                continue
+            if len(line) > _TAIL_TEXT_CHARS:
+                line = line[: _TAIL_TEXT_CHARS - 1] + "…"
+            rows.append(f"{role}: {line}")
+    if not rows:
+        return ""
+    # Room for the mark and a worst-case "omitted" line.
+    budget = _TAIL_DIGEST_BYTES - len(_TAIL_MARK.encode("utf-8")) - 64
+    kept: list[str] = []
+    for row in rows:
+        cost = len(row.encode("utf-8")) + 1  # the row and its newline
+        if cost > budget:
+            break
+        kept.append(row)
+        budget -= cost
+    if len(kept) < len(rows):
+        kept.append(f"({len(rows) - len(kept)} more kept messages not shown)")
+    return "\n".join([_TAIL_MARK, *kept])
+
 
 # -- Engine -------------------------------------------------------------------
 
@@ -381,6 +453,10 @@ class SnapcompactEngine(ContextEngine):
         # Our own size math prices each frame image at this many tokens.
         self.frame_image_tokens: int = DEFAULT_FRAME_IMAGE_TOKENS
 
+        # Plugin setting summary_prompt_file: a path, read at every summary.
+        # A plain string, so host deep copies of the engine stay cheap and safe.
+        self.summary_prompt_file: str = ""
+
         self._bridge_checked = False
 
     @property
@@ -415,6 +491,46 @@ class SnapcompactEngine(ContextEngine):
             )
             tokens = DEFAULT_FRAME_IMAGE_TOKENS
         self.frame_image_tokens = tokens
+
+    def set_summary_prompt_file(self, value: Any) -> None:
+        """Set the summary intro file (plugin setting ``summary_prompt_file``).
+
+        Only the path is kept; the file is read at every compaction, so edits
+        to it apply without a restart.
+        """
+        if value is None or (isinstance(value, str) and not value.strip()):
+            self.summary_prompt_file = ""
+            return
+        if not isinstance(value, str):
+            logger.warning(
+                "snapcompact: ignoring summary_prompt_file=%r (want a path); "
+                "using the built-in summary prompt", value,
+            )
+            self.summary_prompt_file = ""
+            return
+        self.summary_prompt_file = value.strip()
+
+    def _summary_intro(self) -> str:
+        """The summary prompt file's text, or the built-in intro when it is
+        unset, missing, unreadable or empty (with a warning)."""
+        if not self.summary_prompt_file:
+            return _BUILTIN_INTRO
+        path = Path(os.path.expanduser(self.summary_prompt_file))
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "summarize: cannot read summary_prompt_file %s (%s); using the "
+                "built-in summary prompt", path, exc,
+            )
+            return _BUILTIN_INTRO
+        if not text:
+            logger.warning(
+                "summarize: summary_prompt_file %s is empty; using the built-in "
+                "summary prompt", path,
+            )
+            return _BUILTIN_INTRO
+        return text
 
     # -- Core interface -------------------------------------------------------
 
@@ -730,16 +846,13 @@ class SnapcompactEngine(ContextEngine):
 
     def _summary_request(
         self, plan: _Plan, serialized: str, focus_topic: str | None, with_images: bool,
+        intro: str = _BUILTIN_INTRO,
     ) -> str | list[dict[str, Any]]:
         """The summarizer input: every folded artifact oldest first, then the
-        newer conversation. A plain string unless page images are included."""
-        focus = f" Focus on preserving details about: {focus_topic}" if focus_topic else ""
-        intro = (
-            "Summarize the following conversation history into a concise but "
-            "complete handoff document. Preserve key decisions, file paths, "
-            "code changes, error details, and current task state. Do NOT "
-            f"omit actionable specifics.{focus}"
-        )
+        newer conversation, then a read-only digest of the kept tail. A plain
+        string unless page images are included."""
+        if focus_topic:
+            intro += f" Focus on preserving details about: {focus_topic}"
         if plan.folded:
             intro += (
                 " Parts marked [Earlier summary] or [Archived earlier history] are older "
@@ -768,6 +881,9 @@ class SnapcompactEngine(ContextEngine):
             blocks.append({"type": "text", "text": (
                 f"[Newer conversation]\n{serialized}" if plan.folded else serialized
             )})
+        digest = _tail_digest(plan.tail)
+        if digest:
+            blocks.append({"type": "text", "text": digest})
         if not with_images:
             return "\n\n".join(block["text"] for block in blocks)
         merged: list[dict[str, Any]] = []
@@ -818,6 +934,9 @@ class SnapcompactEngine(ContextEngine):
                 messages, current_tokens, focus_topic, force, memory_context,
             )
 
+        # Read the prompt file once per compaction, so edits apply at the next one.
+        intro = self._summary_intro()
+
         # Archives from past processes survive only as page images. Show the
         # summarizer the images when its model takes them; otherwise (or if
         # that request fails or is too big) use their stored text.
@@ -826,7 +945,7 @@ class SnapcompactEngine(ContextEngine):
         summary = ""
         with_images = False
         for with_images in attempts:
-            request = self._summary_request(plan, serialized, focus_topic, with_images)
+            request = self._summary_request(plan, serialized, focus_topic, with_images, intro)
             if with_images and self._request_tokens(request) > self.threshold_tokens:
                 logger.warning(
                     "summarize: request with %d archive page images (~%d tokens) is over "
@@ -927,6 +1046,7 @@ class SnapcompactEngine(ContextEngine):
         status["engine"] = "snapcompact"
         status["mode"] = self.mode
         status["archive_chars"] = sum(len(text) for text in self._frame_sources.values())
+        status["summary_prompt_file"] = self.summary_prompt_file
         status["frame_image_tokens"] = self.frame_image_tokens
         return status
 
