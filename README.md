@@ -27,6 +27,8 @@ Your choice persists across restarts.
 - Lossy: long tool output is truncated. Keep originals for exact recovery.
 - Pays off most in long sessions (~100k+ tokens).
 - Fails safe: if archiving wouldn't shrink the context, nothing changes.
+- One rolling summary: each compaction folds earlier summaries and frame archives into the new one, also after a restart. Old frame archives are read as images if the model takes images; otherwise the summary says their middle is missing.
+- Frame images cost more than Hermes estimates. The plugin prices each at `frame_image_tokens` (default 2500); override in `config.yaml` under `plugins.entries.hermes-snapcompact.settings`.
 
 ## Development
 

@@ -45,6 +45,68 @@ def images(messages):
             for b in m["content"] if b.get("type") == "image_url"]
 
 
+PAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}}
+
+
+def legacy_summary(n):
+    """A 1.0.1 prose summary as stored in the transcript."""
+    return {"role": "user", "content": [{"type": "text", "text": (
+        f"[snapcompact:{n:032x}]\nResume prior conversation. Summary of earlier context:\n\n"
+        f"SUMMARY_{n:02d} " + "Summary detail. " * 300
+    )}]}
+
+
+def legacy_frames(n, pages):
+    """A 1.0.0 frame archive (no marker line) from a process that has since exited."""
+    guide = engine_module._SUMMARY_TEMPLATE.format(
+        image_guide=engine_module._IMAGE_GUIDE_TEMPLATE.format(cols=175, rows=120))
+    return {"role": "user", "content": [
+        {"type": "text", "text": guide},
+        {"type": "text", "text": f"FRAME_{n}_HEAD " + "edge " * 300 + "\n-------------- imaged middle below\n"},
+        *[copy.deepcopy(PAGE) for _ in range(pages)],
+        {"type": "text", "text": "-------------- imaged middle above\n" + "edge " * 300 + f" FRAME_{n}_TAIL"},
+    ]}
+
+
+def tool_call(*ids):
+    return {"role": "assistant", "content": "", "tool_calls": [
+        {"id": i, "type": "function", "function": {"name": "place_proposal", "arguments": "{}"}} for i in ids]}
+
+
+def tool_result(call_id):
+    return {"role": "tool", "tool_call_id": call_id, "content": f"RESULT_{call_id} " + "payload " * 400}
+
+
+def leftovers():
+    """The #ada shape: 13 stacked summaries and 4 pinned frame archives
+    (34 pages), newest first, then a short live tail."""
+    return (
+        [{"role": "system", "content": "System rules"}]
+        + [legacy_summary(n) for n in range(13, 0, -1)]
+        + [legacy_frames(n, pages) for n, pages in ((4, 9), (3, 9), (2, 10), (1, 6))]
+        + [{"role": "user", "content": "OLDER_TURN " + "words " * 400},
+           tool_call("a"), tool_result("a"),
+           tool_call("b", "c", "d"), tool_result("b"), tool_result("c"), tool_result("d"),
+           {"role": "user", "content": "LATEST_ASK"}]
+    )
+
+
+def artifacts(messages):
+    return [m for m in messages if engine_module._parse_artifact(m, {}) is not None]
+
+
+def text_of(message):
+    content = message["content"]
+    return content if isinstance(content, str) else "\n".join(
+        b.get("text", "") for b in content if b.get("type") == "text")
+
+
+def assert_tool_pairs_intact(test, messages):
+    ids = {tc["id"] for m in messages for tc in m.get("tool_calls") or []}
+    results = {m["tool_call_id"] for m in messages if m["role"] == "tool"}
+    test.assertEqual(ids, results)
+
+
 class EngineTests(unittest.TestCase):
     def setUp(self):
         home = tempfile.TemporaryDirectory()
@@ -52,6 +114,7 @@ class EngineTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, HERMES_HOME=home.name))
         self.rendered = []
         self.prompts = []
+        self.requests = []
         self.enterContext(patch.object(engine_module, "_call_bridge", self.render))
         self.enterContext(patch.object(engine_module.SnapcompactEngine, "ensure_ready", return_value=(True, "ready")))
         self.engine = engine_module.SnapcompactEngine()
@@ -65,7 +128,10 @@ class EngineTests(unittest.TestCase):
                 "shape": {}, "geometry": {"cols": 175, "rows": 120}}
 
     def complete(self, **kwargs):
-        prompt = kwargs["messages"][0]["content"]
+        content = kwargs["messages"][0]["content"]
+        self.requests.append(content)
+        prompt = content if isinstance(content, str) else "\n".join(
+            b.get("text", "") for b in content if b.get("type") == "text")
         self.prompts.append(prompt)
         # Distinct facts, not the whole prompt, survive a lossy summary.
         facts = [name for name in ("FIRST_5", "NEXT_5", "THIRD_5") if name in prompt]
@@ -229,6 +295,110 @@ class EngineTests(unittest.TestCase):
                     self.engine.compress(source)
         self.assertEqual(source, before)
 
+    # -- Leftover archives (1.0.x pinned and stacked them) --------------------
+
+    def summarizer(self):
+        """A fresh engine, as after agent re-creation or a surface switch."""
+        engine = engine_module.SnapcompactEngine()
+        engine.mode = "summarize"
+        engine.set_llm(self.engine._llm)
+        engine.update_model("gpt-test", 272_000, provider="openai-codex")
+        return engine
+
+    def vision(self, supported):
+        return patch("agent.image_routing._lookup_supports_vision", return_value=supported)
+
+    def test_leftover_archives_fold_into_one_summary(self):
+        source = leftovers()
+        with self.vision(False):
+            out = self.summarizer().compress(source)
+            self.assertFalse(self.summarizer().has_content_to_compress(out))
+        self.assertEqual(len(artifacts(out)), 1)
+        self.assertFalse(images(out))
+        # System, one summary, and the live tail verbatim; the tail cut moved
+        # back so the first call keeps its result.
+        self.assertEqual(out[0], source[0])
+        self.assertEqual(out[2:], source[-7:])
+        assert_tool_pairs_intact(self, out)
+        # Everything reached the summarizer, oldest first.
+        prompt = self.prompts[-1]
+        order = ["FRAME_1_HEAD", "FRAME_1_TAIL", "FRAME_4_TAIL", "SUMMARY_01", "SUMMARY_13", "OLDER_TURN"]
+        positions = [prompt.index(key) for key in order]
+        self.assertEqual(positions, sorted(positions))
+        # The unreadable middles are disclosed, not silently dropped.
+        summary = text_of(out[1])
+        self.assertIn("[snapcompact:gap]", summary)
+        self.assertIn("34 images", summary)
+
+    def test_archive_pages_go_to_a_summarizer_that_reads_images(self):
+        with self.vision(True):
+            out = self.summarizer().compress(leftovers())
+        self.assertEqual(sum(b.get("type") == "image_url" for b in self.requests[-1]), 34)
+        self.assertEqual(len(artifacts(out)), 1)
+        self.assertFalse(images(out))
+        self.assertNotIn("[snapcompact:gap]", text_of(out[1]))
+
+    def test_rejected_pages_fall_back_to_stored_text(self):
+        def text_only(**kwargs):
+            if not isinstance(kwargs["messages"][0]["content"], str):
+                raise RuntimeError("model rejected image input")
+            return self.complete(**kwargs)
+        engine = self.summarizer()
+        engine.set_llm(PluginLlm(plugin_id="hermes-snapcompact", sync_caller=text_only))
+        with self.vision(True), self.assertLogs(engine_module.logger, level="WARNING"):
+            out = engine.compress(leftovers())
+        self.assertEqual(len(artifacts(out)), 1)
+        self.assertIn("[snapcompact:gap]", text_of(out[1]))
+
+    def test_gap_note_survives_later_summaries(self):
+        with self.vision(False):
+            first = self.summarizer().compress(leftovers())
+            second = self.summarizer().compress(extend(first))
+        self.assertEqual(len(artifacts(second)), 1)
+        self.assertIn("[snapcompact:gap]", text_of(second[1]))
+
+    def test_recreated_agents_merge_summaries_instead_of_stacking(self):
+        out = self.summarizer().compress(history())
+        for tag in ("NEXT", "THIRD"):
+            out = self.summarizer().compress(extend(out, tag))
+            self.assertEqual(len(artifacts(out)), 1)
+        self.assertIn("[Earlier summary]\nRecorded facts: FIRST_5, NEXT_5", self.prompts[-1])
+        self.assertIn("Recorded facts: FIRST_5, NEXT_5, THIRD_5", text_of(out[1]))
+
+    def test_user_picture_stays_while_old_summaries_fold(self):
+        source = leftovers()
+        picture = {"role": "user", "content": [{"type": "text", "text": "Photo of the receipt"}, copy.deepcopy(PAGE)]}
+        source.insert(18, picture)  # right after the archives
+        with self.vision(True):
+            out = self.summarizer().compress(source)
+        self.assertIn(picture, out)
+        self.assertEqual(len(artifacts(out)), 1)
+        assert_tool_pairs_intact(self, out)
+
+    # -- Frame image price ------------------------------------------------------
+
+    def test_preflight_counts_frame_pages_at_their_real_price(self):
+        engine = self.summarizer()
+        source = leftovers()
+        host = engine_module._estimate_tokens_rough(source)
+        underpriced = 34 * (engine.frame_image_tokens - engine_module._host_image_cost())
+        engine.threshold_tokens = host + underpriced // 2
+        self.assertFalse(engine.should_compress(host))
+        self.assertTrue(engine.should_compress_preflight(source))
+        # Once real usage exists it already includes the true image cost.
+        engine.update_from_response({"prompt_tokens": host})
+        self.assertFalse(engine.should_compress_preflight(source))
+
+    def test_frames_that_really_cost_more_than_their_text_are_not_committed(self):
+        pages = {"images": [{"data": "cG5n", "mimeType": "image/png"}] * 16,
+                 "shape": {}, "geometry": {"cols": 175, "rows": 120}}
+        source = history()
+        with patch.object(engine_module, "_call_bridge", return_value=pages):
+            self.assertIs(self.engine.compress(source), source)
+            # At the host's per-image price the same frames look like a saving.
+            self.engine.set_frame_image_tokens(engine_module._host_image_cost())
+            self.assertIsNot(self.engine.compress(source), source)
+
 
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
@@ -274,16 +444,24 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(engine.mode, "summarize")
         self.assertEqual(engine_module.SnapcompactEngine().mode, "snapcompact")
 
-    def register(self, ready=True):
+    def register(self, ready=True, settings=None):
         commands = {}
         engines = []
         ctx = SimpleNamespace(
             llm=None, register_context_engine=engines.append,
             register_command=lambda name, handler, description: commands.update({name: handler}),
+            get_config=lambda key, default=None: (settings or {}).get(key, default),
         )
         with patch.object(engine_module.SnapcompactEngine, "ensure_ready", return_value=(ready, "test bridge")):
             plugin.register(ctx)
         return engines[0], commands["compact-mode"]
+
+    def test_frame_image_price_comes_from_plugin_settings(self):
+        engine, _ = self.register(settings={"frame_image_tokens": 3100})
+        self.assertEqual(engine.frame_image_tokens, 3100)
+        with self.assertLogs(engine_module.logger, level="WARNING"):
+            engine, _ = self.register(settings={"frame_image_tokens": "lots"})
+        self.assertEqual(engine.frame_image_tokens, engine_module.DEFAULT_FRAME_IMAGE_TOKENS)
 
     def test_unavailable_bridge_preserves_opt_in_until_repaired(self):
         engine_module.SnapcompactEngine().set_mode("snapcompact")
@@ -346,6 +524,14 @@ class HostProviderContractTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
         self.assertIn("FIRST_5:", json.dumps(self.requests[0]["input"]))
         self.assertIn("Handoff: FIRST_5 decided.", engine_module.serialize_messages(out))
+        self.assertFalse(images(out))
+
+    def test_archive_pages_reach_the_codex_request_as_images(self):
+        self.engine.update_model("gpt-test", 272_000, provider="openai-codex")
+        with patch("agent.image_routing._lookup_supports_vision", return_value=True):
+            out = self.engine.compress(leftovers())
+        self.assertEqual(json.dumps(self.requests[-1]["input"]).count('"input_image"'), 34)
+        self.assertEqual(len(artifacts(out)), 1)
         self.assertFalse(images(out))
 
 

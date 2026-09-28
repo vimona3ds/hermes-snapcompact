@@ -13,7 +13,7 @@ import logging
 import os
 import sys
 
-from .engine import SnapcompactEngine, VALID_MODES
+from .engine import DEFAULT_FRAME_IMAGE_TOKENS, SnapcompactEngine, VALID_MODES
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,13 @@ def register(ctx):
     """Called by Hermes plugin discovery."""
     engine = SnapcompactEngine()
     engine.set_llm(getattr(ctx, "llm", None))
+    # plugins.entries.hermes-snapcompact.settings.frame_image_tokens in config.yaml
+    get_config = getattr(ctx, "get_config", None)
+    if callable(get_config):
+        try:
+            engine.set_frame_image_tokens(get_config("frame_image_tokens", DEFAULT_FRAME_IMAGE_TOKENS))
+        except Exception:
+            logger.warning("snapcompact: could not read frame_image_tokens; using the default", exc_info=True)
     ctx.register_context_engine(engine)
 
     _auto_activate_engine()
