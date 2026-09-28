@@ -5,6 +5,7 @@ Only the renderer and external model call are replaced; no network or user state
 """
 import copy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -303,6 +304,49 @@ class PersistenceTests(unittest.TestCase):
             engine, command = self.register(ready=False)
         command("summarize")
         self.assertEqual(engine_module.SnapcompactEngine().mode, "summarize")
+
+
+class HostProviderContractTests(unittest.TestCase):
+    """The summary request must survive Hermes' real provider adapter, not only the PluginLlm facade.
+
+    Hermes routes openai-codex auxiliary calls through ``_CodexCompletionsAdapter``, whose request
+    builder iterates ``messages`` and calls ``.get`` on each one. 1.0.0 passed the prompt as a bare
+    string, so every summary on a Codex-backed install failed with
+    ``'str' object has no attribute 'get'`` and fell back to frames (137 times on one VPS,
+    2026-09-21 to 2026-09-28).
+    """
+
+    def setUp(self):
+        try:
+            from agent.auxiliary_client import _CodexCompletionsAdapter
+        except ImportError:
+            self.skipTest("this Hermes has no Codex auxiliary adapter")
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.enterContext(patch.dict(os.environ, HERMES_HOME=home.name))
+        # No renderer: a failed summary raises here instead of falling back to frames.
+        self.enterContext(patch.object(engine_module.SnapcompactEngine, "ensure_ready", return_value=(False, "no renderer in this test")))
+        self.adapter = _CodexCompletionsAdapter(None, "gpt-test")
+        self.requests = []
+        self.engine = engine_module.SnapcompactEngine()
+        self.engine.mode = "summarize"
+        self.engine.set_llm(PluginLlm(plugin_id="hermes-snapcompact", sync_caller=self.codex))
+
+    def codex(self, **kw):
+        """The host's own chat -> Responses request builder, then a canned reply (no network)."""
+        request, model, _timeout = self.adapter._build_responses_kwargs({"model": "gpt-test", "messages": kw["messages"]})
+        self.requests.append(request)
+        return "openai-codex", model, SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Handoff: FIRST_5 decided."))],
+            model=model, usage=None,
+        )
+
+    def test_summary_request_passes_the_codex_request_builder(self):
+        out = self.engine.compress(history())
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("FIRST_5:", json.dumps(self.requests[0]["input"]))
+        self.assertIn("Handoff: FIRST_5 decided.", engine_module.serialize_messages(out))
+        self.assertFalse(images(out))
 
 
 
