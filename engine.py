@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import textwrap
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -237,6 +238,103 @@ def _is_task_request(message: dict[str, Any]) -> bool:
             and not _message_text(message).lstrip().startswith("[OUT-OF-BAND USER MESSAGE"))
 
 
+# -- Engine artifacts in the transcript ---------------------------------------
+
+# Every summary or frame archive starts with a marker line and a fixed opening.
+# 1.0.0 frame archives had no marker line, so the opening alone also counts.
+# Finding artifacts in the transcript (not only in memory) lets a re-created
+# agent, a restart or another surface fold them instead of stacking them.
+_MARKER_RE = re.compile(r"\[snapcompact:[0-9a-f]{32}\]\n")
+_ARTIFACT_RE = re.compile(
+    r"(?:\[snapcompact:[0-9a-f]{32}\]\n)?Resume prior conversation\. "
+    r"(?P<kind>Summary of earlier context:|Earlier turns archived under HISTORY below)"
+)
+_SUMMARY_HEADER = "Resume prior conversation. Summary of earlier context:\n\n"
+_SUMMARY_BACKGROUND = (
+    "Background reference only; continue the live user request below "
+    "and its later corrections, not completed earlier tasks.\n\n"
+)
+
+# A summary line starting with this says part of the history was lost to
+# unreadable page images. Later summaries carry these lines forward verbatim.
+_GAP_PREFIX = "[snapcompact:gap]"
+
+# Real input cost of one rendered frame (~1568x1562 PNG). Hermes learns one
+# per-image price for every image and, for frames, it came out far too low
+# (371 learned vs ~2,500 real on gpt-6-astra, fitted from 44 compactions).
+DEFAULT_FRAME_IMAGE_TOKENS = 2500
+_MIN_IMAGE_TOKENS, _MAX_IMAGE_TOKENS = 64, 32_768
+
+
+@dataclass
+class _Artifact:
+    """A summary or frame archive found in the transcript."""
+
+    message: dict[str, Any]
+    kind: str  # "summary" or "frames"
+    # Summary body; a frame archive's full source when known, else its stored text.
+    text: str
+    # Frame archives: stored blocks (reading guide, edge text, page images).
+    blocks: list[dict[str, Any]] = field(default_factory=list)
+    images: int = 0
+    # False when part of the history exists only as page images.
+    complete: bool = True
+
+
+@dataclass
+class _Plan:
+    """How one compaction splits the transcript."""
+
+    system: list[dict[str, Any]]
+    head: list[dict[str, Any]]  # kept verbatim, before the new artifact
+    archive: list[dict[str, Any]]  # new history to summarize or render
+    tail: list[dict[str, Any]]  # recent turns kept verbatim
+    folded: list[_Artifact]  # earlier artifacts to merge in, oldest first
+
+    def worth_compressing(self, *, summarize: bool) -> bool:
+        """New history to archive, artifacts to merge, or frames to turn into text."""
+        if self.archive or len(self.folded) >= 2:
+            return True
+        return summarize and any(a.kind == "frames" for a in self.folded)
+
+
+def _parse_artifact(msg: Any, frame_sources: dict[str, str]) -> _Artifact | None:
+    """Recognise an engine summary or frame archive, or return None."""
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return None
+    content = msg.get("content")
+    blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+    if not isinstance(blocks, list) or not blocks:
+        return None
+    if any(not isinstance(b, dict) or b.get("type") not in ("text", "image_url") for b in blocks):
+        return None  # Something the fold cannot carry: leave it to the pin rule.
+    first = blocks[0]
+    match = _ARTIFACT_RE.match(str(first.get("text", ""))) if first.get("type") == "text" else None
+    if match is None:
+        return None
+    stripped = [{**first, "text": _MARKER_RE.sub("", str(first["text"]), count=1)}] + blocks[1:]
+    images = sum(1 for b in blocks if b.get("type") == "image_url")
+    if match["kind"].startswith("Summary") and not images:
+        body = "\n\n".join(str(b.get("text", "")) for b in stripped)
+        return _Artifact(msg, "summary", body.removeprefix(_SUMMARY_HEADER).removeprefix(_SUMMARY_BACKGROUND))
+    source = frame_sources.get(_msg_text_signature(msg))
+    if source is not None:
+        return _Artifact(msg, "frames", source, stripped, images)
+    # Past-process archive: the reading guide is block 0; the rest is edge text.
+    text = "\n".join(str(b.get("text", "")) for b in stripped[1:] if b.get("type") == "text")
+    return _Artifact(msg, "frames", text, stripped, images, complete=not images)
+
+
+def _host_image_cost() -> int:
+    """Per-image price Hermes' rough estimator charges (see _estimate_tokens_rough)."""
+    try:
+        from agent.image_token_cost import current_image_token_cost
+
+        return int(current_image_token_cost())
+    except Exception:
+        return 1600
+
+
 # -- Summary prompt -----------------------------------------------------------
 
 _SUMMARY_TEMPLATE = textwrap.dedent("""\
@@ -266,6 +364,78 @@ _IMAGE_GUIDE_TEMPLATE = textwrap.dedent("""\
       - Frame: one grid {cols} characters wide, up to {rows} rows tall; read \
     left→right, top→bottom. No word wrap; words may break across rows.
     """)
+
+# Built-in summarizer intro, used when no summary_prompt_file is set or it
+# cannot be read.
+_BUILTIN_INTRO = (
+    "Summarize the following conversation history into a concise but "
+    "complete handoff document. Preserve key decisions, file paths, "
+    "code changes, error details, and current task state. Do NOT "
+    "omit actionable specifics."
+)
+
+# The kept tail stays verbatim after the summary. The summarizer sees a short
+# digest of it, so it does not call a thing unanswered only because the answer
+# sits in the tail. Bounded: a large tool result in the tail must not blow up
+# the summary request.
+_TAIL_MARK = "[Kept verbatim after your summary: do not summarize or repeat]"
+_TAIL_TEXT_CHARS = 300
+_TAIL_DIGEST_BYTES = 4096
+
+
+def _plain_text(content: Any) -> str:
+    """Text of a message's content; other blocks (images, thinking) skipped."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(b.get("text", "")) for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def _tail_digest(tail: list[dict[str, Any]]) -> str:
+    """A read-only digest of the kept tail, at most _TAIL_DIGEST_BYTES (UTF-8).
+
+    User and assistant text is cut to _TAIL_TEXT_CHARS each, on one line;
+    tool results become ``tool <name> (N chars)``. Rows that would pass the
+    byte limit are dropped and counted in a last line. Empty when there is
+    nothing to show.
+    """
+    names = {
+        call.get("id"): (call.get("function") or {}).get("name") or "?"
+        for message in tail for call in message.get("tool_calls") or []
+        if isinstance(call, dict)
+    }
+    rows: list[str] = []
+    for message in tail:
+        role = message.get("role")
+        text = _plain_text(message.get("content"))
+        if role == "tool":
+            name = names.get(message.get("tool_call_id")) or message.get("name") or "?"
+            rows.append(f"tool {name} ({len(text)} chars)")
+        elif role in ("user", "assistant"):
+            line = " ".join(text.split())
+            if not line:
+                continue
+            if len(line) > _TAIL_TEXT_CHARS:
+                line = line[: _TAIL_TEXT_CHARS - 1] + "…"
+            rows.append(f"{role}: {line}")
+    if not rows:
+        return ""
+    # Room for the mark and a worst-case "omitted" line.
+    budget = _TAIL_DIGEST_BYTES - len(_TAIL_MARK.encode("utf-8")) - 64
+    kept: list[str] = []
+    for row in rows:
+        cost = len(row.encode("utf-8")) + 1  # the row and its newline
+        if cost > budget:
+            break
+        kept.append(row)
+        budget -= cost
+    if len(kept) < len(rows):
+        kept.append(f"({len(rows) - len(kept)} more kept messages not shown)")
+    return "\n".join([_TAIL_MARK, *kept])
 
 
 # -- Engine -------------------------------------------------------------------
@@ -305,10 +475,17 @@ class SnapcompactEngine(ContextEngine):
         self._model_id: str = ""
         self._provider: str = ""
         self._api_mode: str = ""
-        self._archive_text: str = ""
-        # Keep the accepted artifact and its proposed replacement until the
-        # next transcript tells us which one the host actually committed.
-        self._archive_states: dict[str, tuple[str, str]] = {}
+        # Full text of frame archives this process rendered, by message
+        # signature. Only the pixels survive in the transcript; entries whose
+        # archive is no longer in the transcript are dropped on the next pass.
+        self._frame_sources: dict[str, str] = {}
+
+        # Our own size math prices each frame image at this many tokens.
+        self.frame_image_tokens: int = DEFAULT_FRAME_IMAGE_TOKENS
+
+        # Plugin setting summary_prompt_file: a path, read at every summary.
+        # A plain string, so host deep copies of the engine stay cheap and safe.
+        self.summary_prompt_file: str = ""
 
         self._bridge_checked = False
 
@@ -331,6 +508,60 @@ class SnapcompactEngine(ContextEngine):
         self.mode = mode
         return _persist_mode(mode)
 
+    def set_frame_image_tokens(self, value: Any) -> None:
+        """Set the per-frame-image price (plugin setting ``frame_image_tokens``)."""
+        try:
+            tokens = int(value)
+        except (TypeError, ValueError):
+            tokens = 0
+        if not _MIN_IMAGE_TOKENS <= tokens <= _MAX_IMAGE_TOKENS:
+            logger.warning(
+                "snapcompact: ignoring frame_image_tokens=%r (want %d-%d); using %d",
+                value, _MIN_IMAGE_TOKENS, _MAX_IMAGE_TOKENS, DEFAULT_FRAME_IMAGE_TOKENS,
+            )
+            tokens = DEFAULT_FRAME_IMAGE_TOKENS
+        self.frame_image_tokens = tokens
+
+    def set_summary_prompt_file(self, value: Any) -> None:
+        """Set the summary intro file (plugin setting ``summary_prompt_file``).
+
+        Only the path is kept; the file is read at every compaction, so edits
+        to it apply without a restart.
+        """
+        if value is None or (isinstance(value, str) and not value.strip()):
+            self.summary_prompt_file = ""
+            return
+        if not isinstance(value, str):
+            logger.warning(
+                "snapcompact: ignoring summary_prompt_file=%r (want a path); "
+                "using the built-in summary prompt", value,
+            )
+            self.summary_prompt_file = ""
+            return
+        self.summary_prompt_file = value.strip()
+
+    def _summary_intro(self) -> str:
+        """The summary prompt file's text, or the built-in intro when it is
+        unset, missing, unreadable or empty (with a warning)."""
+        if not self.summary_prompt_file:
+            return _BUILTIN_INTRO
+        path = Path(os.path.expanduser(self.summary_prompt_file))
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "summarize: cannot read summary_prompt_file %s (%s); using the "
+                "built-in summary prompt", path, exc,
+            )
+            return _BUILTIN_INTRO
+        if not text:
+            logger.warning(
+                "summarize: summary_prompt_file %s is empty; using the built-in "
+                "summary prompt", path,
+            )
+            return _BUILTIN_INTRO
+        return text
+
     # -- Core interface -------------------------------------------------------
 
     def update_from_response(self, usage: dict[str, Any]) -> None:
@@ -341,6 +572,20 @@ class SnapcompactEngine(ContextEngine):
     def should_compress(self, prompt_tokens: int | None = None) -> bool:
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         return tokens > 0 and tokens >= self.threshold_tokens
+
+    def should_compress_preflight(self, messages: list[dict[str, Any]]) -> bool:
+        """Catch what the host's estimate misses before any real usage exists.
+
+        With real usage (after the first response) the host's figure already
+        includes the true image cost. Before it (new or re-created agent), the
+        host prices each frame image far too low; count them honestly here.
+        """
+        if self.last_prompt_tokens != 0 or self.threshold_tokens <= 0:
+            return False
+        host, honest = self._estimate(messages)
+        return honest > host and honest >= self.threshold_tokens and (
+            self.has_content_to_compress(messages)
+        )
 
     def compress(
         self,
@@ -372,10 +617,8 @@ class SnapcompactEngine(ContextEngine):
         """Compact via bitmap-frame rendering."""
         self._ensure_bridge()
 
-        system_msgs, keep_head, to_archive, keep_tail, archive_text, previous_summary = (
-            self._prepare_history(messages)
-        )
-        if not to_archive:
+        plan = self._prepare_history(messages, fold_image_only=False)
+        if not plan.worth_compressing(summarize=False):
             return messages
 
         # Check if any of the models we talk to are Anthropic — if so,
@@ -384,24 +627,22 @@ class SnapcompactEngine(ContextEngine):
 
         # Serialize archived messages to compact text.
         serialized = serialize_messages(
-            to_archive,
+            plan.archive,
             include_thinking=not is_anthropic,
         )
-        if not serialized.strip():
-            return messages
 
-        # Only carry history whose artifact is present in the actual input.
-        # A proposed replacement may have been rejected by the host.
-        if archive_text:
-            base = f"{archive_text}{NEWLINE_GLYPH}"
-        elif previous_summary:
-            base = (
-                f"[Summary of earlier history] {previous_summary}"
-                f" [Recent conversation] "
-            )
-        else:
-            base = ""
-        archive_source = base + serialized
+        # Carry every folded artifact, oldest first, then the new history.
+        # Archives whose middle survives only as pixels are never folded here
+        # (they cannot be re-rendered from text); they stay in place.
+        pieces = [
+            a.text if a.kind == "frames" else f"[Summary of earlier history] {a.text}"
+            for a in plan.folded
+        ]
+        if serialized.strip():
+            pieces.append(f"[Recent conversation] {serialized}" if plan.folded else serialized)
+        archive_source = NEWLINE_GLYPH.join(p for p in pieces if p.strip())
+        if not archive_source.strip():
+            return messages
 
         # Determine shape target for the renderer.
         shape_target: dict[str, str] = {}
@@ -494,27 +735,20 @@ class SnapcompactEngine(ContextEngine):
         }
 
         # Build the compressed message list.
-        result = list(system_msgs) + list(keep_head) + [summary_msg] + list(keep_tail)
+        result = plan.system + plan.head + [summary_msg] + plan.tail
 
-        # Self-check with the host's own anti-growth arithmetic: below a
-        # certain archive size, the flat per-image price plus guide/edge
-        # overhead exceeds what the frames remove, and the host would refuse
-        # the commit anyway (user-facing warning + an ineffective-compaction
-        # strike). Bow out cleanly instead, mutating no engine state.
-        rough_in = _estimate_tokens_rough(messages)
-        rough_out = _estimate_tokens_rough(result)
-        if rough_out >= rough_in:
-            logger.info(
-                "snapcompact: rendering would not shrink the transcript "
-                "(~%d -> ~%d tokens) — archive too small to amortize frame "
-                "overhead; leaving transcript unchanged",
-                rough_in, rough_out,
-            )
+        # Self-check: below a certain archive size, the frames plus guide and
+        # edge text cost more than they remove. Check with the host's own
+        # anti-growth arithmetic (else it refuses the commit with a warning and
+        # an ineffective-compaction strike) and with honest frame prices.
+        # Bow out cleanly instead, mutating no engine state.
+        sizes = self._shrink_check(messages, result, "snapcompact: rendering")
+        if sizes is None:
             return messages
 
-        # This is a proposal, not a host commit. Retain the prior state until
-        # a later input contains this exact artifact instead of its predecessor.
-        self._archive_states[_msg_text_signature(summary_msg)] = (archive_source, "")
+        # This is a proposal, not a host commit: the next transcript shows
+        # whether it was kept. Until then its text lives beside the old ones.
+        self._frame_sources[_msg_text_signature(summary_msg)] = archive_source
         self.compression_count += 1
 
         # Reset prompt token tracking — the host will re-measure after the
@@ -522,40 +756,33 @@ class SnapcompactEngine(ContextEngine):
         self.last_prompt_tokens = -1
 
         logger.info(
-            "snapcompact: archived %d chars onto %d frame(s) (~%d -> ~%d "
-            "tokens), compression #%d",
-            len(archive_source), len(images), rough_in, rough_out,
-            self.compression_count,
+            "snapcompact: archived %d chars onto %d frame(s), folded %d earlier "
+            "artifact(s) (~%d -> ~%d tokens; ~%d -> ~%d with frames at %d each), "
+            "compression #%d",
+            len(archive_source), len(images), len(plan.folded), *sizes,
+            self.frame_image_tokens, self.compression_count,
         )
 
         return result
 
-    # -- Summarize mode -------------------------------------------------------
+    # -- Shared helpers ---------------------------------------------------------
 
     def _prepare_history(
-        self, messages: list[dict[str, Any]],
-    ) -> tuple[
-        list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
-        list[dict[str, Any]], str, str,
-    ]:
-        """Reconcile proposals against the transcript and choose a safe slice."""
-        system, conversation = self._split_system(messages)
-        archive_text, previous_summary = "", ""
-        retained_states = {}
-        for index, message in enumerate(conversation):
-            key = _msg_text_signature(message)
-            if key in self._archive_states:
-                archive_text, previous_summary = self._archive_states[key]
-                retained_states[key] = (archive_text, previous_summary)
-                conversation = conversation[:index] + conversation[index + 1:]
-                break
-        self._archive_states = retained_states
-        self._archive_text = archive_text
+        self, messages: list[dict[str, Any]], *, fold_image_only: bool,
+    ) -> _Plan:
+        """Find earlier summaries and archives in the transcript; choose a safe slice.
 
-        # Older releases emitted archive -> protected head -> tail. A resumed
-        # artifact has no local state, so retain its blocks but restore head ->
-        # archive order before selecting a new middle. Keep head tool groups whole.
-        if conversation and _is_archive_message(conversation[0]):
+        Earlier artifacts are folded into the next one, so the transcript never
+        carries more than one. ``fold_image_only`` also folds archives whose
+        middle survives only as page images (the summarizer reads the images
+        or the summary records the gap); the frame path keeps those in place.
+        """
+        system, conversation = self._split_system(messages)
+        # Legacy releases put a single archive before the protected opening.
+        # Move it behind that opening on a successful proposal. Stacked legacy
+        # artifacts remain newest-first for the existing folding logic.
+        if (conversation and _is_archive_message(conversation[0])
+                and (len(conversation) == 1 or not _is_archive_message(conversation[1]))):
             archive, following = conversation[0], conversation[1:]
             boundary = min(self.protect_first_n, len(following))
             pending = set()
@@ -567,18 +794,40 @@ class SnapcompactEngine(ContextEngine):
                     pending.discard(message.get("tool_call_id"))
                 boundary = max(boundary, index + 1)
             conversation = following[:boundary] + [archive] + following[boundary:]
-
-        start = self.protect_first_n
-        end = max(0, len(conversation) - self.protect_last_n)
-        # Row counts alone can retire the task while leaving only its tool results
-        # and a later steer live. Keep the entire latest ordinary user turn.
+        tail_count = min(self.protect_last_n, len(conversation))
+        cut = len(conversation) - tail_count
+        # Keep the latest ordinary request and all later activity live. Steering
+        # and plugin artifacts do not begin a new task turn.
         for index in range(len(conversation) - 1, -1, -1):
             if _is_task_request(conversation[index]):
+                cut = min(cut, index)
+                break
+        found = [
+            _parse_artifact(message, self._frame_sources) if index < cut else None
+            for index, message in enumerate(conversation)
+        ]
+        # Forget sources whose archive left the transcript (folded, or a
+        # proposal the host rejected).
+        present = {_msg_text_signature(a.message) for a in found if a is not None}
+        self._frame_sources = {k: v for k, v in self._frame_sources.items() if k in present}
+
+        fold = [a is not None and (a.complete or fold_image_only) for a in found]
+        # Each artifact was inserted at the front, so they sit newest first.
+        folded = [a for a, f in zip(found, fold) if f][::-1]
+        body = [message for message, f in zip(conversation, fold) if not f]
+
+        # Like Hermes' own compressor: once the session has been compacted,
+        # the first turns lose their protection, or they would fossilize.
+        start = 0 if any(a is not None for a in found) else self.protect_first_n
+        end = max(0, len(body) - tail_count)
+        for index in range(len(body) - 1, -1, -1):
+            if _is_task_request(body[index]):
                 end = min(end, index)
                 break
         # A text serializer cannot preserve pictures, audio, or unknown blocks.
-        # Protect the prefix through them, including archives from past processes.
-        for index, message in enumerate(conversation[:end]):
+        # Protect the prefix through them, including archives that could not
+        # be folded above.
+        for index, message in enumerate(body[:end]):
             content = message.get("content")
             if message.get("role") not in ("user", "assistant", "tool") or (
                 isinstance(content, list) and any(
@@ -591,7 +840,7 @@ class SnapcompactEngine(ContextEngine):
         # Never leave a tool result without its call (or a call without results).
         calls = {}
         spans = {}
-        for index, message in enumerate(conversation):
+        for index, message in enumerate(body):
             for call in message.get("tool_calls") or []:
                 calls[call.get("id")] = index
             if message.get("role") == "tool":
@@ -605,10 +854,110 @@ class SnapcompactEngine(ContextEngine):
             if left < end <= right:
                 end = left
         if start >= end:
-            return system, conversation, [], [], archive_text, previous_summary
-        return (
-            system, conversation[:start], conversation[start:end], conversation[end:],
-            archive_text, previous_summary,
+            return _Plan(system, body[:end], [], body[end:], folded)
+        return _Plan(system, body[:start], body[start:end], body[end:], folded)
+
+    def _estimate(self, messages: list[dict[str, Any]]) -> tuple[int, int]:
+        """(host estimate, honest estimate): the latter prices frame images
+        at ``frame_image_tokens`` instead of the host's learned price."""
+        host = _estimate_tokens_rough(messages)
+        frames = sum(
+            artifact.images for artifact in (_parse_artifact(m, {}) for m in messages)
+            if artifact is not None
+        )
+        return host, host + frames * max(0, self.frame_image_tokens - _host_image_cost())
+
+    def _shrink_check(
+        self, messages: list[dict[str, Any]], result: list[dict[str, Any]], label: str,
+    ) -> tuple[int, int, int, int] | None:
+        """Sizes (host in/out, honest in/out) when ``result`` shrinks by both
+        measures; None (and a log line) when it would not."""
+        host_in, honest_in = self._estimate(messages)
+        host_out, honest_out = self._estimate(result)
+        if host_out >= host_in or honest_out >= honest_in:
+            logger.info(
+                "%s would not shrink the transcript (~%d -> ~%d tokens; ~%d -> ~%d "
+                "with frames at %d each); leaving transcript unchanged",
+                label, host_in, host_out, honest_in, honest_out, self.frame_image_tokens,
+            )
+            return None
+        return host_in, host_out, honest_in, honest_out
+
+    # -- Summarize mode -------------------------------------------------------
+
+    def _summarizer_reads_images(self) -> bool:
+        """True only when Hermes knows the summary model takes image input."""
+        if not (self._provider and self._model_id):
+            return False
+        try:
+            from agent.image_routing import _lookup_supports_vision
+            from hermes_cli.config import load_config_readonly
+
+            return _lookup_supports_vision(
+                self._provider, self._model_id, load_config_readonly(),
+            ) is True
+        except Exception:
+            logger.debug("summarize: vision lookup failed; reading archives as text", exc_info=True)
+            return False
+
+    def _summary_request(
+        self, plan: _Plan, serialized: str, focus_topic: str | None, with_images: bool,
+        intro: str = _BUILTIN_INTRO,
+    ) -> str | list[dict[str, Any]]:
+        """The summarizer input: every folded artifact oldest first, then the
+        newer conversation, then a read-only digest of the kept tail. A plain
+        string unless page images are included."""
+        if focus_topic:
+            intro += f" Focus on preserving details about: {focus_topic}"
+        if plan.folded:
+            intro += (
+                " Parts marked [Earlier summary] or [Archived earlier history] are older "
+                "history of the same conversation, oldest first. Merge them and the newer "
+                "conversation into ONE summary, and keep every item from them that is still open."
+            )
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": intro}]
+        for artifact in plan.folded:
+            if artifact.kind == "summary":
+                blocks.append({"type": "text", "text": f"[Earlier summary]\n{artifact.text}"})
+            elif artifact.complete:
+                blocks.append({"type": "text", "text": f"[Archived earlier history]\n{artifact.text}"})
+            elif with_images:
+                blocks.append({"type": "text", "text": (
+                    "[Archived earlier history, kept as page images. Read the "
+                    "guide, the edge text and every page in order.]"
+                )})
+                blocks.extend(artifact.blocks)
+            else:
+                blocks.append({"type": "text", "text": (
+                    "[Archived earlier history. Only its start and end survive as text; "
+                    f"the middle was kept only as {artifact.images} page images, which "
+                    "cannot be read here. Say so in the summary.]\n" + artifact.text
+                )})
+        if serialized.strip():
+            blocks.append({"type": "text", "text": (
+                f"[Newer conversation]\n{serialized}" if plan.folded else serialized
+            )})
+        digest = _tail_digest(plan.tail)
+        if digest:
+            blocks.append({"type": "text", "text": digest})
+        if not with_images:
+            return "\n\n".join(block["text"] for block in blocks)
+        merged: list[dict[str, Any]] = []
+        for block in blocks:
+            if block.get("type") == "text" and merged and merged[-1].get("type") == "text":
+                merged[-1] = {"type": "text", "text": f"{merged[-1]['text']}\n\n{block['text']}"}
+            else:
+                merged.append(block)
+        return merged
+
+    def _request_tokens(self, request: str | list[dict[str, Any]]) -> int:
+        """Honest size of a summarizer request."""
+        if isinstance(request, str):
+            return len(request) // 4
+        return sum(
+            self.frame_image_tokens if block.get("type") == "image_url"
+            else len(str(block.get("text", ""))) // 4
+            for block in request
         )
 
     def _compress_summarize(
@@ -619,25 +968,15 @@ class SnapcompactEngine(ContextEngine):
         force: bool = False,
         memory_context: str = "",
     ) -> list[dict[str, Any]]:
-        """Compact via LLM prose summary."""
-        system_msgs, keep_head, to_archive, keep_tail, archive_text, previous_summary = (
-            self._prepare_history(messages)
-        )
-        if not to_archive:
+        """Compact via one rolling LLM prose summary."""
+        plan = self._prepare_history(messages, fold_image_only=True)
+        if not plan.worth_compressing(summarize=True):
             return messages
 
         is_anthropic = "claude" in self._model_id.lower() or self._provider == "anthropic"
-        serialized = serialize_messages(to_archive, include_thinking=not is_anthropic)
-        if not serialized.strip():
+        serialized = serialize_messages(plan.archive, include_thinking=not is_anthropic)
+        if not serialized.strip() and not plan.folded:
             return messages
-
-        # Fold prior engine state into the summary input so a mode switch
-        # never strands history: frame-archive text (its message was dropped
-        # above and only existed as pixels) and any earlier prose summary.
-        if archive_text:
-            serialized = f"[Archived earlier history]\n{archive_text}\n\n[Newer conversation]\n{serialized}"
-        if previous_summary:
-            serialized = f"[Earlier summary]\n{previous_summary}\n\n{serialized}"
 
         if self._llm is None:
             ok, detail = self.ensure_ready()
@@ -651,65 +990,87 @@ class SnapcompactEngine(ContextEngine):
                 messages, current_tokens, focus_topic, force, memory_context,
             )
 
-        focus = f" Focus on preserving details about: {focus_topic}" if focus_topic else ""
-        prompt = (
-            "Summarize the following conversation history into a concise but "
-            "complete handoff document. Preserve key decisions, file paths, "
-            "code changes, error details, and current task state. Do NOT "
-            f"omit actionable specifics.{focus}\n\n{serialized}"
-        )
-        try:
-            # Host contract: PluginLlm.complete(messages) -> result with .text.
-            completion = self._llm.complete([{"role": "user", "content": prompt}])
-            summary = getattr(completion, "text", "") or ""
-            if not summary.strip():
-                raise RuntimeError("LLM returned an empty summary")
-        except Exception:
-            if not self.bridge_ready():
-                raise
-            logger.exception("LLM summary failed; falling back to snapcompact mode")
-            return self._compress_snapcompact(
-                messages, current_tokens, focus_topic, force, memory_context,
-            )
+        # Read the prompt file once per compaction, so edits apply at the next one.
+        intro = self._summary_intro()
 
-        summary_msg: dict[str, Any] = {
-            "role": "user",
-            "content": [{
-                "type": "text",
-                "text": (
-                    f"[snapcompact:{uuid.uuid4().hex}]\n"
-                    "Resume prior conversation. Summary of earlier context:\n"
-                    "Background reference only; continue the live user request below "
-                    "and its later corrections, not completed earlier tasks.\n\n"
-                    + summary
-                ),
-            }],
-        }
-        result = list(system_msgs) + list(keep_head) + [summary_msg] + list(keep_tail)
+        # Archives from past processes survive only as page images. Show the
+        # summarizer the images when its model takes them; otherwise (or if
+        # that request fails or is too big) use their stored text.
+        image_only = [a for a in plan.folded if not a.complete]
+        attempts = [True, False] if image_only and self._summarizer_reads_images() else [False]
+        summary = ""
+        with_images = False
+        for with_images in attempts:
+            request = self._summary_request(plan, serialized, focus_topic, with_images, intro)
+            if with_images and self._request_tokens(request) > self.threshold_tokens:
+                logger.warning(
+                    "summarize: request with %d archive page images (~%d tokens) is over "
+                    "%d; reading their stored text only",
+                    sum(a.images for a in image_only), self._request_tokens(request),
+                    self.threshold_tokens,
+                )
+                continue
+            try:
+                # Host contract: PluginLlm.complete(messages) -> result with .text.
+                completion = self._llm.complete([{"role": "user", "content": request}])
+                summary = getattr(completion, "text", "") or ""
+                if not summary.strip():
+                    raise RuntimeError("LLM returned an empty summary")
+                break
+            except Exception:
+                if with_images:
+                    logger.warning(
+                        "summarize: summary with archive page images failed; "
+                        "retrying from their stored text", exc_info=True,
+                    )
+                    continue
+                if not self.bridge_ready():
+                    raise
+                logger.exception("LLM summary failed; falling back to snapcompact mode")
+                return self._compress_snapcompact(
+                    messages, current_tokens, focus_topic, force, memory_context,
+                )
+
+        # Say plainly when part of the history could not be read, and keep
+        # saying it in every later summary.
+        gaps = [
+            line for a in plan.folded if a.kind == "summary"
+            for line in a.text.splitlines() if line.startswith(_GAP_PREFIX)
+        ]
+        if image_only and not with_images:
+            gaps.append(
+                f"{_GAP_PREFIX} Part of this conversation was archived only as page images "
+                f"({len(image_only)} archive(s), {sum(a.images for a in image_only)} images) "
+                "that could not be read back. Only the start and end of that stretch are "
+                "in this summary; its middle is missing."
+            )
+        gaps = [line for line in dict.fromkeys(gaps) if line not in summary]
+        text = (f"[snapcompact:{uuid.uuid4().hex}]\n{_SUMMARY_HEADER}"
+                + _SUMMARY_BACKGROUND + summary)
+        if gaps:
+            text += "\n\n" + "\n".join(gaps)
+        summary_msg: dict[str, Any] = {"role": "user", "content": [{"type": "text", "text": text}]}
+        result = plan.system + plan.head + [summary_msg] + plan.tail
 
         # Same anti-growth self-check as the snapcompact path: bow out with
         # no state mutation rather than hand the host a growing transcript.
-        rough_in = _estimate_tokens_rough(messages)
-        rough_out = _estimate_tokens_rough(result)
-        if rough_out >= rough_in:
-            logger.info(
-                "summarize: generated summary would not shrink the transcript "
-                "(~%d -> ~%d tokens); leaving transcript unchanged",
-                rough_in, rough_out,
-            )
+        sizes = self._shrink_check(messages, result, "summarize: generated summary")
+        if sizes is None:
             return messages
 
-        self._archive_states[_msg_text_signature(summary_msg)] = ("", summary)
         self.compression_count += 1
         self.last_prompt_tokens = -1
 
         logger.info(
-            "snapcompact(summarize): compressed %d messages into %d-char summary "
-            "(~%d -> ~%d tokens), #%d",
-            len(to_archive), len(summary), rough_in, rough_out,
-            self.compression_count,
+            "snapcompact(summarize): compressed %d messages and folded %d earlier "
+            "artifact(s) (%d page images, %s) into a %d-char summary (~%d -> ~%d "
+            "tokens; ~%d -> ~%d with frames at %d each), #%d",
+            len(plan.archive), len(plan.folded), sum(a.images for a in image_only),
+            "read" if with_images else "text only", len(summary), *sizes,
+            self.frame_image_tokens, self.compression_count,
         )
         return result
+
     # -- Optional overrides ---------------------------------------------------
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
@@ -721,8 +1082,7 @@ class SnapcompactEngine(ContextEngine):
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
-        self._archive_text = ""
-        self._archive_states = {}
+        self._frame_sources = {}
 
     def update_model(
         self,
@@ -742,12 +1102,15 @@ class SnapcompactEngine(ContextEngine):
         status = super().get_status()
         status["engine"] = "snapcompact"
         status["mode"] = self.mode
-        status["archive_chars"] = len(self._archive_text)
+        status["archive_chars"] = sum(len(text) for text in self._frame_sources.values())
+        status["summary_prompt_file"] = self.summary_prompt_file
+        status["frame_image_tokens"] = self.frame_image_tokens
         return status
 
     def has_content_to_compress(self, messages: list[dict[str, Any]]) -> bool:
-        _, _, to_archive, _, _, _ = self._prepare_history(messages)
-        return bool(to_archive)
+        summarize = self.mode == "summarize"
+        plan = self._prepare_history(messages, fold_image_only=summarize)
+        return plan.worth_compressing(summarize=summarize)
 
     # -- Internal helpers -----------------------------------------------------
 

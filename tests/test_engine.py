@@ -5,6 +5,7 @@ Only the renderer and external model call are replaced; no network or user state
 """
 import copy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -67,6 +68,68 @@ def archive_message(messages):
     return next(m for m in messages if '[snapcompact:' in engine_module._msg_text_signature(m))
 
 
+PAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}}
+
+
+def legacy_summary(n):
+    """A 1.0.1 prose summary as stored in the transcript."""
+    return {"role": "user", "content": [{"type": "text", "text": (
+        f"[snapcompact:{n:032x}]\nResume prior conversation. Summary of earlier context:\n\n"
+        f"SUMMARY_{n:02d} " + "Summary detail. " * 300
+    )}]}
+
+
+def legacy_frames(n, pages):
+    """A 1.0.0 frame archive (no marker line) from a process that has since exited."""
+    guide = engine_module._SUMMARY_TEMPLATE.format(
+        image_guide=engine_module._IMAGE_GUIDE_TEMPLATE.format(cols=175, rows=120))
+    return {"role": "user", "content": [
+        {"type": "text", "text": guide},
+        {"type": "text", "text": f"FRAME_{n}_HEAD " + "edge " * 300 + "\n-------------- imaged middle below\n"},
+        *[copy.deepcopy(PAGE) for _ in range(pages)],
+        {"type": "text", "text": "-------------- imaged middle above\n" + "edge " * 300 + f" FRAME_{n}_TAIL"},
+    ]}
+
+
+def tool_call(*ids):
+    return {"role": "assistant", "content": "", "tool_calls": [
+        {"id": i, "type": "function", "function": {"name": "place_proposal", "arguments": "{}"}} for i in ids]}
+
+
+def tool_result(call_id):
+    return {"role": "tool", "tool_call_id": call_id, "content": f"RESULT_{call_id} " + "payload " * 400}
+
+
+def leftovers():
+    """The #ada shape: 13 stacked summaries and 4 pinned frame archives
+    (34 pages), newest first, then a short live tail."""
+    return (
+        [{"role": "system", "content": "System rules"}]
+        + [legacy_summary(n) for n in range(13, 0, -1)]
+        + [legacy_frames(n, pages) for n, pages in ((4, 9), (3, 9), (2, 10), (1, 6))]
+        + [{"role": "user", "content": "OLDER_TURN " + "words " * 400},
+           tool_call("a"), tool_result("a"),
+           tool_call("b", "c", "d"), tool_result("b"), tool_result("c"), tool_result("d"),
+           {"role": "user", "content": "LATEST_ASK"}]
+    )
+
+
+def artifacts(messages):
+    return [m for m in messages if engine_module._parse_artifact(m, {}) is not None]
+
+
+def text_of(message):
+    content = message["content"]
+    return content if isinstance(content, str) else "\n".join(
+        b.get("text", "") for b in content if b.get("type") == "text")
+
+
+def assert_tool_pairs_intact(test, messages):
+    ids = {tc["id"] for m in messages for tc in m.get("tool_calls") or []}
+    results = {m["tool_call_id"] for m in messages if m["role"] == "tool"}
+    test.assertEqual(ids, results)
+
+
 class EngineTests(unittest.TestCase):
     def setUp(self):
         home = tempfile.TemporaryDirectory()
@@ -74,6 +137,7 @@ class EngineTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, HERMES_HOME=home.name))
         self.rendered = []
         self.prompts = []
+        self.requests = []
         self.enterContext(patch.object(engine_module, "_call_bridge", self.render))
         self.enterContext(patch.object(engine_module.SnapcompactEngine, "ensure_ready", return_value=(True, "ready")))
         self.engine = engine_module.SnapcompactEngine()
@@ -87,7 +151,10 @@ class EngineTests(unittest.TestCase):
                 "shape": {}, "geometry": {"cols": 175, "rows": 120}}
 
     def complete(self, **kwargs):
-        prompt = kwargs["messages"][0]["content"]
+        content = kwargs["messages"][0]["content"]
+        self.requests.append(content)
+        prompt = content if isinstance(content, str) else "\n".join(
+            b.get("text", "") for b in content if b.get("type") == "text")
         self.prompts.append(prompt)
         # Distinct facts, not the whole prompt, survive a lossy summary.
         facts = [name for name in ("FIRST_5", "NEXT_5", "THIRD_5") if name in prompt]
@@ -141,11 +208,11 @@ class EngineTests(unittest.TestCase):
                 source, active = task_history()
                 out = self.engine.compress(first + source[1:])
                 self.assertEqual(out[-len(active):], active)
-                self.assertEqual(out[:4], first[:4])
-                self.assertEqual(out[4], archive_message(out))
+                self.assertEqual(out[:1], first[:1])
+                self.assertEqual(len(artifacts(out)), 1)
                 retired = self.rendered[-1] if mode == 'snapcompact' else self.prompts[-1]
                 self.assertNotIn('[snapcompact:', retired)
-                self.assertNotIn('CURRENT: audit installed software', retired)
+                self.assertNotIn('CURRENT: audit installed software', retired.split(engine_module._TAIL_MARK)[0])
 
     def test_fresh_engine_after_native_persistence_keeps_bitmap_and_active_request(self):
         from hermes_state import SessionDB
@@ -166,10 +233,14 @@ class EngineTests(unittest.TestCase):
                 fresh.set_llm(self.engine._llm)
                 out = fresh.compress(restored)
                 self.assertEqual(out[-len(active):], restored[-len(active):])
-                self.assertIn(archive_message(restored), out)
-                self.assertEqual(archive_message(restored)["content"], archive_message(first)["content"])
-                self.assertEqual(out[:4], restored[:4])
-                self.assertEqual(images(out)[:1], images(first))
+                if mode == 'snapcompact':
+                    self.assertIn(archive_message(restored), out)
+                    self.assertEqual(out[:4], restored[:4])
+                    self.assertEqual(images(out)[:1], images(first))
+                else:
+                    self.assertEqual(len(artifacts(out)), 1)
+                    self.assertFalse(images(out))
+                    self.assertIn("[snapcompact:gap]", text_of(archive_message(out)))
 
     def test_legacy_leading_archive_stays_after_original_head_on_fresh_engine(self):
         first = self.engine.compress(history())
@@ -185,12 +256,17 @@ class EngineTests(unittest.TestCase):
                     fresh.mode = mode
                     fresh.set_llm(self.engine._llm)
                     out = fresh.compress(legacy)
-                    self.assertEqual(out[:4], first[:4])
-                    self.assertEqual(out[4], archive)
                     self.assertEqual(out[-len(active):], active)
-                    self.assertEqual(images(out)[:1], images([archive]))
+                    if mode == 'snapcompact':
+                        self.assertEqual(out[:4], first[:4])
+                        self.assertEqual(out[4], archive)
+                        self.assertEqual(images(out)[:1], images([archive]))
+                    else:
+                        self.assertEqual(len(artifacts(out)), 1)
+                        self.assertFalse(images(out))
+                        self.assertIn("[snapcompact:gap]", text_of(archive_message(out)))
 
-    def test_legacy_archive_without_new_middle_leaves_original_transcript_intact(self):
+    def test_legacy_archive_without_savings_leaves_original_transcript_intact(self):
         first = self.engine.compress(history())
         legacy = first[:1] + [archive_message(first)] + first[1:4] + first[5:]
         before = copy.deepcopy(legacy)
@@ -200,11 +276,25 @@ class EngineTests(unittest.TestCase):
                 fresh = engine_module.SnapcompactEngine()
                 fresh.mode = mode
                 fresh.set_llm(self.engine._llm)
-                self.assertFalse(fresh.has_content_to_compress(legacy))
-                self.assertIs(fresh.compress(legacy), legacy)
+                with patch.object(fresh, "_shrink_check", return_value=None):
+                    self.assertIs(fresh.compress(legacy), legacy)
                 self.assertEqual(legacy, before)
         self.assertEqual(len(self.rendered), render_count)
-        self.assertFalse(self.prompts)
+
+    def test_fold_only_places_archive_before_long_active_turn(self):
+        _, active = task_history()
+        for mode in ('snapcompact', 'summarize'):
+            with self.subTest(mode=mode):
+                fresh = self.summarizer() if mode == 'summarize' else self.engine
+                fresh.mode = mode
+                older = [legacy_summary(1), legacy_summary(2)]
+                for message in older:
+                    message['content'][0]['text'] += 'Archived material. ' * 3000
+                source = older + active
+                out = fresh.compress(source)
+                self.assertEqual(out[-len(active):], active)
+                self.assertEqual(len(artifacts(out)), 1)
+                self.assertEqual(out[0], archive_message(out))
 
     def test_repeated_frames_replace_predecessor(self):
         first = self.engine.compress(history())
@@ -361,6 +451,204 @@ class EngineTests(unittest.TestCase):
                     self.engine.compress(source)
         self.assertEqual(source, before)
 
+    # -- Leftover archives (1.0.x pinned and stacked them) --------------------
+
+    def summarizer(self):
+        """A fresh engine, as after agent re-creation or a surface switch."""
+        engine = engine_module.SnapcompactEngine()
+        engine.mode = "summarize"
+        engine.set_llm(self.engine._llm)
+        engine.update_model("gpt-test", 272_000, provider="openai-codex")
+        return engine
+
+    def vision(self, supported):
+        return patch("agent.image_routing._lookup_supports_vision", return_value=supported)
+
+    def test_leftover_archives_fold_into_one_summary(self):
+        source = leftovers()
+        with self.vision(False):
+            out = self.summarizer().compress(source)
+            self.assertFalse(self.summarizer().has_content_to_compress(out))
+        self.assertEqual(len(artifacts(out)), 1)
+        self.assertFalse(images(out))
+        # System, one summary, and the live tail verbatim; the tail cut moved
+        # back so the first call keeps its result.
+        self.assertEqual(out[0], source[0])
+        self.assertEqual(out[2:], source[-7:])
+        assert_tool_pairs_intact(self, out)
+        # Everything reached the summarizer, oldest first.
+        prompt = self.prompts[-1]
+        order = ["FRAME_1_HEAD", "FRAME_1_TAIL", "FRAME_4_TAIL", "SUMMARY_01", "SUMMARY_13", "OLDER_TURN"]
+        positions = [prompt.index(key) for key in order]
+        self.assertEqual(positions, sorted(positions))
+        # The unreadable middles are disclosed, not silently dropped.
+        summary = text_of(out[1])
+        self.assertIn("[snapcompact:gap]", summary)
+        self.assertIn("34 images", summary)
+
+    def test_archive_pages_go_to_a_summarizer_that_reads_images(self):
+        with self.vision(True):
+            out = self.summarizer().compress(leftovers())
+        self.assertEqual(sum(b.get("type") == "image_url" for b in self.requests[-1]), 34)
+        self.assertEqual(len(artifacts(out)), 1)
+        self.assertFalse(images(out))
+        self.assertNotIn("[snapcompact:gap]", text_of(out[1]))
+
+    def test_rejected_pages_fall_back_to_stored_text(self):
+        def text_only(**kwargs):
+            if not isinstance(kwargs["messages"][0]["content"], str):
+                raise RuntimeError("model rejected image input")
+            return self.complete(**kwargs)
+        engine = self.summarizer()
+        engine.set_llm(PluginLlm(plugin_id="hermes-snapcompact", sync_caller=text_only))
+        with self.vision(True), self.assertLogs(engine_module.logger, level="WARNING"):
+            out = engine.compress(leftovers())
+        self.assertEqual(len(artifacts(out)), 1)
+        self.assertIn("[snapcompact:gap]", text_of(out[1]))
+
+    def test_gap_note_survives_later_summaries(self):
+        with self.vision(False):
+            first = self.summarizer().compress(leftovers())
+            second = self.summarizer().compress(extend(first))
+        self.assertEqual(len(artifacts(second)), 1)
+        self.assertIn("[snapcompact:gap]", text_of(second[1]))
+
+    def test_recreated_agents_merge_summaries_instead_of_stacking(self):
+        out = self.summarizer().compress(history())
+        for tag in ("NEXT", "THIRD"):
+            out = self.summarizer().compress(extend(out, tag))
+            self.assertEqual(len(artifacts(out)), 1)
+        self.assertIn("[Earlier summary]\nRecorded facts: FIRST_5, NEXT_5", self.prompts[-1])
+        self.assertIn("Recorded facts: FIRST_5, NEXT_5, THIRD_5", text_of(out[1]))
+
+    def test_user_picture_stays_while_old_summaries_fold(self):
+        source = leftovers()
+        picture = {"role": "user", "content": [{"type": "text", "text": "Photo of the receipt"}, copy.deepcopy(PAGE)]}
+        source.insert(18, picture)  # right after the archives
+        with self.vision(True):
+            out = self.summarizer().compress(source)
+        self.assertIn(picture, out)
+        self.assertEqual(len(artifacts(out)), 1)
+        assert_tool_pairs_intact(self, out)
+
+    # -- Summary prompt file and the kept-tail digest -----------------------------
+
+    def prompt_file(self, text):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "compact-prompt.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def assert_one_summary(self, out):
+        self.assertEqual(len(artifacts(out)), 1)
+        self.assertIn(engine_module._SUMMARY_HEADER, text_of(archive_message(out)))
+
+    def test_prompt_file_is_read_at_every_compaction(self):
+        path = self.prompt_file("PROMPT_V1: write Ada's handoff.\n")
+        engine = self.summarizer()
+        engine.set_summary_prompt_file(str(path))
+        out = engine.compress(history())
+        self.assertTrue(self.prompts[-1].startswith("PROMPT_V1"))
+        self.assertNotIn(engine_module._BUILTIN_INTRO, self.prompts[-1])
+        self.assert_one_summary(out)
+        # An edit applies at the next compaction, with no new engine.
+        path.write_text("PROMPT_V2: write Ada's handoff.\n", encoding="utf-8")
+        out = engine.compress(extend(out))
+        prompt = self.prompts[-1]
+        self.assertTrue(prompt.startswith("PROMPT_V2"))
+        self.assertNotIn("PROMPT_V1", prompt)
+        # The merge rule still follows the file's text, then the earlier summary.
+        self.assertLess(prompt.index("Merge them"), prompt.index("[Earlier summary]\n"))
+        self.assert_one_summary(out)
+        self.assertIn("Recorded facts: FIRST_5, NEXT_5", text_of(out[1]))
+
+    def test_missing_or_empty_prompt_file_falls_back_to_the_built_in_prompt(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        empty = Path(folder.name) / "empty.md"
+        empty.write_text("  \n", encoding="utf-8")
+        for path in (Path(folder.name) / "missing.md", empty, Path(folder.name)):
+            with self.subTest(path=path.name):
+                engine = self.summarizer()
+                engine.set_summary_prompt_file(str(path))
+                with self.assertLogs(engine_module.logger, level="WARNING"):
+                    out = engine.compress(history())
+                self.assertTrue(self.prompts[-1].startswith(engine_module._BUILTIN_INTRO))
+                self.assert_one_summary(out)
+
+    def test_prompt_file_removed_between_compactions_falls_back(self):
+        path = self.prompt_file("PROMPT_V1: write Ada's handoff.\n")
+        engine = self.summarizer()
+        engine.set_summary_prompt_file(str(path))
+        out = engine.compress(history())
+        path.unlink()
+        with self.assertLogs(engine_module.logger, level="WARNING"):
+            out = engine.compress(extend(out))
+        self.assertTrue(self.prompts[-1].startswith(engine_module._BUILTIN_INTRO))
+        self.assert_one_summary(out)
+
+    def test_summarizer_sees_a_bounded_digest_of_the_kept_tail(self):
+        big = {"role": "tool", "tool_call_id": "big", "content": "BIG_RESULT " + "x" * 100_000}
+        source = history() + [
+            tool_call("big"), big,
+            {"role": "assistant", "content": "ANSWER_SENT " + "Here is today's plan. " * 100},
+            {"role": "user", "content": "LATEST_ASK"},
+        ]
+        out = self.summarizer().compress(source)
+        self.assert_one_summary(out)
+        self.assertEqual(out[-6:], source[-6:])  # the tail itself stays verbatim
+        prompt = self.prompts[-1]
+        mark = "[Kept verbatim after your summary: do not summarize or repeat]"
+        self.assertEqual(prompt.count(mark), 1)
+        digest = prompt[prompt.index(mark):]
+        self.assertLessEqual(len(digest.encode("utf-8")), 4096)
+        self.assertNotIn("BIG_RESULT", prompt)
+        rows = digest.splitlines()[1:]
+        self.assertIn(f"tool place_proposal ({len(big['content'])} chars)", rows)
+        self.assertIn("user: LATEST_ASK", rows)
+        self.assertTrue(any(row.startswith("assistant: ANSWER_SENT") for row in rows))
+        for row in rows:
+            role, _, text = row.partition(": ")
+            if role in ("user", "assistant"):
+                self.assertLessEqual(len(text), 300)
+        # The archived slice is still summarized in full, before the digest.
+        self.assertLess(prompt.index("FIRST_5:"), prompt.index(mark))
+
+    def test_tail_digest_stays_under_4_kb_however_long_the_tail(self):
+        tail = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"TURN_{i} " + "é" * 5_000}
+                for i in range(40)]
+        digest = engine_module._tail_digest(tail)
+        self.assertLessEqual(len(digest.encode("utf-8")), 4096)
+        self.assertIn("TURN_0 ", digest)
+        self.assertNotIn("TURN_39 ", digest)
+        self.assertRegex(digest.splitlines()[-1], r"^\(\d+ more kept messages not shown\)$")
+        self.assertEqual(engine_module._tail_digest([]), "")
+
+    # -- Frame image price ------------------------------------------------------
+
+    def test_preflight_counts_frame_pages_at_their_real_price(self):
+        engine = self.summarizer()
+        source = leftovers()
+        host = engine_module._estimate_tokens_rough(source)
+        underpriced = 34 * (engine.frame_image_tokens - engine_module._host_image_cost())
+        engine.threshold_tokens = host + underpriced // 2
+        self.assertFalse(engine.should_compress(host))
+        self.assertTrue(engine.should_compress_preflight(source))
+        # Once real usage exists it already includes the true image cost.
+        engine.update_from_response({"prompt_tokens": host})
+        self.assertFalse(engine.should_compress_preflight(source))
+
+    def test_frames_that_really_cost_more_than_their_text_are_not_committed(self):
+        pages = {"images": [{"data": "cG5n", "mimeType": "image/png"}] * 16,
+                 "shape": {}, "geometry": {"cols": 175, "rows": 120}}
+        source = history()
+        with patch.object(engine_module, "_call_bridge", return_value=pages):
+            self.assertIs(self.engine.compress(source), source)
+            # At the host's per-image price the same frames look like a saving.
+            self.engine.set_frame_image_tokens(engine_module._host_image_cost())
+            self.assertIsNot(self.engine.compress(source), source)
+
 
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
@@ -406,16 +694,35 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(engine.mode, "summarize")
         self.assertEqual(engine_module.SnapcompactEngine().mode, "snapcompact")
 
-    def register(self, ready=True):
+    def register(self, ready=True, settings=None):
         commands = {}
         engines = []
         ctx = SimpleNamespace(
             llm=None, register_context_engine=engines.append,
             register_command=lambda name, handler, description: commands.update({name: handler}),
+            get_config=lambda key, default=None: (settings or {}).get(key, default),
         )
         with patch.object(engine_module.SnapcompactEngine, "ensure_ready", return_value=(ready, "test bridge")):
             plugin.register(ctx)
         return engines[0], commands["compact-mode"]
+
+    def test_frame_image_price_comes_from_plugin_settings(self):
+        engine, _ = self.register(settings={"frame_image_tokens": 3100})
+        self.assertEqual(engine.frame_image_tokens, 3100)
+        with self.assertLogs(engine_module.logger, level="WARNING"):
+            engine, _ = self.register(settings={"frame_image_tokens": "lots"})
+        self.assertEqual(engine.frame_image_tokens, engine_module.DEFAULT_FRAME_IMAGE_TOKENS)
+
+    def test_summary_prompt_file_comes_from_plugin_settings(self):
+        engine, _ = self.register()
+        self.assertEqual(engine.summary_prompt_file, "")
+        engine, _ = self.register(settings={"summary_prompt_file": "/srv/prompts/ada.md"})
+        self.assertEqual(engine.summary_prompt_file, "/srv/prompts/ada.md")
+        # Host clones (one per agent) keep the path, not a handle to ctx.
+        self.assertEqual(copy.deepcopy(engine).summary_prompt_file, "/srv/prompts/ada.md")
+        with self.assertLogs(engine_module.logger, level="WARNING"):
+            engine, _ = self.register(settings={"summary_prompt_file": ["not", "a", "path"]})
+        self.assertEqual(engine.summary_prompt_file, "")
 
     def test_unavailable_bridge_preserves_opt_in_until_repaired(self):
         engine_module.SnapcompactEngine().set_mode("snapcompact")
@@ -436,6 +743,57 @@ class PersistenceTests(unittest.TestCase):
             engine, command = self.register(ready=False)
         command("summarize")
         self.assertEqual(engine_module.SnapcompactEngine().mode, "summarize")
+
+
+class HostProviderContractTests(unittest.TestCase):
+    """The summary request must survive Hermes' real provider adapter, not only the PluginLlm facade.
+
+    Hermes routes openai-codex auxiliary calls through ``_CodexCompletionsAdapter``, whose request
+    builder iterates ``messages`` and calls ``.get`` on each one. 1.0.0 passed the prompt as a bare
+    string, so every summary on a Codex-backed install failed with
+    ``'str' object has no attribute 'get'`` and fell back to frames (137 times on one VPS,
+    2026-09-21 to 2026-09-28).
+    """
+
+    def setUp(self):
+        try:
+            from agent.auxiliary_client import _CodexCompletionsAdapter
+        except ImportError:
+            self.skipTest("this Hermes has no Codex auxiliary adapter")
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.enterContext(patch.dict(os.environ, HERMES_HOME=home.name))
+        # No renderer: a failed summary raises here instead of falling back to frames.
+        self.enterContext(patch.object(engine_module.SnapcompactEngine, "ensure_ready", return_value=(False, "no renderer in this test")))
+        self.adapter = _CodexCompletionsAdapter(None, "gpt-test")
+        self.requests = []
+        self.engine = engine_module.SnapcompactEngine()
+        self.engine.mode = "summarize"
+        self.engine.set_llm(PluginLlm(plugin_id="hermes-snapcompact", sync_caller=self.codex))
+
+    def codex(self, **kw):
+        """The host's own chat -> Responses request builder, then a canned reply (no network)."""
+        request, model, _timeout = self.adapter._build_responses_kwargs({"model": "gpt-test", "messages": kw["messages"]})
+        self.requests.append(request)
+        return "openai-codex", model, SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Handoff: FIRST_5 decided."))],
+            model=model, usage=None,
+        )
+
+    def test_summary_request_passes_the_codex_request_builder(self):
+        out = self.engine.compress(history())
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("FIRST_5:", json.dumps(self.requests[0]["input"]))
+        self.assertIn("Handoff: FIRST_5 decided.", engine_module.serialize_messages(out))
+        self.assertFalse(images(out))
+
+    def test_archive_pages_reach_the_codex_request_as_images(self):
+        self.engine.update_model("gpt-test", 272_000, provider="openai-codex")
+        with patch("agent.image_routing._lookup_supports_vision", return_value=True):
+            out = self.engine.compress(leftovers())
+        self.assertEqual(json.dumps(self.requests[-1]["input"]).count('"input_image"'), 34)
+        self.assertEqual(len(artifacts(out)), 1)
+        self.assertFalse(images(out))
 
 
 
