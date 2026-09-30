@@ -214,6 +214,30 @@ def _msg_text_signature(msg: dict[str, Any]) -> str:
     return f"{msg.get('role', '')}\u0000{text}"
 
 
+def _message_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(block.get("text", "")) for block in content
+                         if isinstance(block, dict) and block.get("type") == "text")
+    return ""
+
+
+def _is_archive_message(message: dict[str, Any]) -> bool:
+    text = re.sub(r"^\[snapcompact:[0-9a-f]{32}\]\n", "", _message_text(message), count=1)
+    return message.get("role") == "user" and text.startswith((
+        "Resume prior conversation. Earlier turns archived under HISTORY below,",
+        "Resume prior conversation. Summary of earlier context:",
+    ))
+
+
+def _is_task_request(message: dict[str, Any]) -> bool:
+    return (message.get("role") == "user" and not _is_archive_message(message)
+            and message.get("display_kind") != "steer"
+            and not _message_text(message).lstrip().startswith("[OUT-OF-BAND USER MESSAGE"))
+
+
 # -- Engine artifacts in the transcript ---------------------------------------
 
 # Every summary or frame archive starts with a marker line and a fixed opening.
@@ -226,6 +250,10 @@ _ARTIFACT_RE = re.compile(
     r"(?P<kind>Summary of earlier context:|Earlier turns archived under HISTORY below)"
 )
 _SUMMARY_HEADER = "Resume prior conversation. Summary of earlier context:\n\n"
+_SUMMARY_BACKGROUND = (
+    "Background reference only; continue the live user request below "
+    "and its later corrections, not completed earlier tasks.\n\n"
+)
 
 # A summary line starting with this says part of the history was lost to
 # unreadable page images. Later summaries carry these lines forward verbatim.
@@ -258,7 +286,7 @@ class _Plan:
     """How one compaction splits the transcript."""
 
     system: list[dict[str, Any]]
-    head: list[dict[str, Any]]  # kept verbatim, after the new artifact
+    head: list[dict[str, Any]]  # kept verbatim, before the new artifact
     archive: list[dict[str, Any]]  # new history to summarize or render
     tail: list[dict[str, Any]]  # recent turns kept verbatim
     folded: list[_Artifact]  # earlier artifacts to merge in, oldest first
@@ -288,7 +316,7 @@ def _parse_artifact(msg: Any, frame_sources: dict[str, str]) -> _Artifact | None
     images = sum(1 for b in blocks if b.get("type") == "image_url")
     if match["kind"].startswith("Summary") and not images:
         body = "\n\n".join(str(b.get("text", "")) for b in stripped)
-        return _Artifact(msg, "summary", body.removeprefix(_SUMMARY_HEADER))
+        return _Artifact(msg, "summary", body.removeprefix(_SUMMARY_HEADER).removeprefix(_SUMMARY_BACKGROUND))
     source = frame_sources.get(_msg_text_signature(msg))
     if source is not None:
         return _Artifact(msg, "frames", source, stripped, images)
@@ -311,7 +339,9 @@ def _host_image_cost() -> int:
 
 _SUMMARY_TEMPLATE = textwrap.dedent("""\
     Resume prior conversation. Earlier turns archived under HISTORY below, \
-    oldest→newest. Read HISTORY fully; continue the live conversation following it.
+    oldest→newest. Treat HISTORY and earlier messages as background reference. \
+    Continue the live user request following HISTORY and its later corrections; \
+    do not reopen completed earlier tasks.
 
     Archived transcript scopes:
     - `¶user:`, `¶think:`, `¶ai:`, `¶call:`: user, assistant reasoning, assistant reply, tool call.
@@ -705,7 +735,7 @@ class SnapcompactEngine(ContextEngine):
         }
 
         # Build the compressed message list.
-        result = plan.system + [summary_msg] + plan.head + plan.tail
+        result = plan.system + plan.head + [summary_msg] + plan.tail
 
         # Self-check: below a certain archive size, the frames plus guide and
         # edge text cost more than they remove. Check with the host's own
@@ -748,8 +778,30 @@ class SnapcompactEngine(ContextEngine):
         or the summary records the gap); the frame path keeps those in place.
         """
         system, conversation = self._split_system(messages)
+        # Legacy releases put a single archive before the protected opening.
+        # Move it behind that opening on a successful proposal. Stacked legacy
+        # artifacts remain newest-first for the existing folding logic.
+        if (conversation and _is_archive_message(conversation[0])
+                and (len(conversation) == 1 or not _is_archive_message(conversation[1]))):
+            archive, following = conversation[0], conversation[1:]
+            boundary = min(self.protect_first_n, len(following))
+            pending = set()
+            for index, message in enumerate(following):
+                if index >= boundary and not pending:
+                    break
+                pending.update(call.get("id") for call in message.get("tool_calls") or [])
+                if message.get("role") == "tool":
+                    pending.discard(message.get("tool_call_id"))
+                boundary = max(boundary, index + 1)
+            conversation = following[:boundary] + [archive] + following[boundary:]
         tail_count = min(self.protect_last_n, len(conversation))
         cut = len(conversation) - tail_count
+        # Keep the latest ordinary request and all later activity live. Steering
+        # and plugin artifacts do not begin a new task turn.
+        for index in range(len(conversation) - 1, -1, -1):
+            if _is_task_request(conversation[index]):
+                cut = min(cut, index)
+                break
         found = [
             _parse_artifact(message, self._frame_sources) if index < cut else None
             for index, message in enumerate(conversation)
@@ -767,7 +819,11 @@ class SnapcompactEngine(ContextEngine):
         # Like Hermes' own compressor: once the session has been compacted,
         # the first turns lose their protection, or they would fossilize.
         start = 0 if any(a is not None for a in found) else self.protect_first_n
-        end = len(body) - tail_count
+        end = max(0, len(body) - tail_count)
+        for index in range(len(body) - 1, -1, -1):
+            if _is_task_request(body[index]):
+                end = min(end, index)
+                break
         # A text serializer cannot preserve pictures, audio, or unknown blocks.
         # Protect the prefix through them, including archives that could not
         # be folded above.
@@ -798,7 +854,7 @@ class SnapcompactEngine(ContextEngine):
             if left < end <= right:
                 end = left
         if start >= end:
-            return _Plan(system, body, [], [], folded)
+            return _Plan(system, body[:end], [], body[end:], folded)
         return _Plan(system, body[:start], body[start:end], body[end:], folded)
 
     def _estimate(self, messages: list[dict[str, Any]]) -> tuple[int, int]:
@@ -989,11 +1045,12 @@ class SnapcompactEngine(ContextEngine):
                 "in this summary; its middle is missing."
             )
         gaps = [line for line in dict.fromkeys(gaps) if line not in summary]
-        text = f"[snapcompact:{uuid.uuid4().hex}]\n{_SUMMARY_HEADER}{summary}"
+        text = (f"[snapcompact:{uuid.uuid4().hex}]\n{_SUMMARY_HEADER}"
+                + _SUMMARY_BACKGROUND + summary)
         if gaps:
             text += "\n\n" + "\n".join(gaps)
         summary_msg: dict[str, Any] = {"role": "user", "content": [{"type": "text", "text": text}]}
-        result = plan.system + [summary_msg] + plan.head + plan.tail
+        result = plan.system + plan.head + [summary_msg] + plan.tail
 
         # Same anti-growth self-check as the snapcompact path: bow out with
         # no state mutation rather than hand the host a growing transcript.

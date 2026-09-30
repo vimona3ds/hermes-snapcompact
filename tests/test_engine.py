@@ -45,6 +45,29 @@ def images(messages):
             for b in m["content"] if b.get("type") == "image_url"]
 
 
+def task_history():
+    """Completed task, fresh task, long tool loop, then an in-flight correction."""
+    from agent.prompt_builder import steer_user_row
+    messages = history()
+    messages[1]['content'] = 'COMPLETED: record sleep'
+    messages[2]['content'] = 'Sleep recorded; that task is finished.'
+    active = [{'role': 'user', 'content': 'CURRENT: audit installed software'}]
+    for i in range(12):
+        active += [
+            {'role': 'assistant', 'content': None, 'tool_calls': [{
+                'id': f'audit-{i}', 'type': 'function',
+                'function': {'name': 'inspect', 'arguments': '{}'},
+            }]},
+            {'role': 'tool', 'tool_call_id': f'audit-{i}', 'content': f'audit result {i}'},
+        ]
+    active += [steer_user_row('Include OpenMuse in the audit.')]
+    return messages + active, active
+
+
+def archive_message(messages):
+    return next(m for m in messages if '[snapcompact:' in engine_module._msg_text_signature(m))
+
+
 PAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}}
 
 
@@ -140,6 +163,139 @@ class EngineTests(unittest.TestCase):
             model="test-model", usage=None,
         )
 
+    def test_current_request_and_later_steer_stay_live_after_history(self):
+        source, active = task_history()
+        before = copy.deepcopy(source)
+        for mode in ('snapcompact', 'summarize'):
+            with self.subTest(mode=mode):
+                self.engine.mode = mode
+                out = self.engine.compress(source)
+                self.assertEqual(out[:4], source[:4])
+                self.assertEqual(out[-len(active):], active)
+                self.assertEqual(out[4], archive_message(out))
+                self.assertLess(len(out), len(source))
+        self.assertEqual(source, before)
+
+    def test_active_only_turn_is_not_archived(self):
+        _, active = task_history()
+        for mode in ('snapcompact', 'summarize'):
+            with self.subTest(mode=mode):
+                self.engine.mode = mode
+                self.assertFalse(self.engine.has_content_to_compress(active))
+                self.assertIs(self.engine.compress(active), active)
+        self.assertFalse(self.rendered)
+        self.assertFalse(self.prompts)
+
+    def test_plugin_handoffs_are_not_new_user_requests(self):
+        for prefix in ('', '[snapcompact:0123456789abcdef0123456789abcdef]\n'):
+            for guide in ('Resume prior conversation. Earlier turns archived under HISTORY below,',
+                          'Resume prior conversation. Summary of earlier context:'):
+                for mode in ('snapcompact', 'summarize'):
+                    with self.subTest(prefix=prefix, guide=guide, mode=mode):
+                        self.engine.mode = mode
+                        source = [{'role': 'user', 'content': 'CURRENT task'}]
+                        source += [{'role': 'assistant', 'content': 'tool progress ' * 2000}] * 10
+                        source += [{'role': 'user', 'content': [{'type': 'text', 'text': prefix + guide}]}]
+                        source += [{'role': 'assistant', 'content': 'more progress'}] * 10
+                        self.assertFalse(self.engine.has_content_to_compress(source))
+                        self.assertIs(self.engine.compress(source), source)
+
+    def test_repeated_handoff_preserves_current_request_and_does_not_nest_archive(self):
+        for mode in ('snapcompact', 'summarize'):
+            with self.subTest(mode=mode):
+                self.engine.mode = mode
+                first = self.engine.compress(history())
+                source, active = task_history()
+                out = self.engine.compress(first + source[1:])
+                self.assertEqual(out[-len(active):], active)
+                self.assertEqual(out[:1], first[:1])
+                self.assertEqual(len(artifacts(out)), 1)
+                retired = self.rendered[-1] if mode == 'snapcompact' else self.prompts[-1]
+                self.assertNotIn('[snapcompact:', retired)
+                self.assertNotIn('CURRENT: audit installed software', retired.split(engine_module._TAIL_MARK)[0])
+
+    def test_fresh_engine_after_native_persistence_keeps_bitmap_and_active_request(self):
+        from hermes_state import SessionDB
+        source, active = task_history()
+        first = self.engine.compress(history())
+        tmp = self.enterContext(tempfile.TemporaryDirectory())
+        db = SessionDB(Path(tmp) / 'handoff.db')
+        self.addCleanup(db.close)
+        db.create_session('handoff', 'test')
+        db.append_messages_batch('handoff', first + source[1:])
+        restored = db.get_messages_as_conversation('handoff')
+        self.assertEqual([(m['role'], m['content']) for m in restored[-len(active):]],
+                         [(m['role'], m['content']) for m in active])
+        for mode in ('snapcompact', 'summarize'):
+            with self.subTest(mode=mode):
+                fresh = engine_module.SnapcompactEngine()
+                fresh.mode = mode
+                fresh.set_llm(self.engine._llm)
+                out = fresh.compress(restored)
+                self.assertEqual(out[-len(active):], restored[-len(active):])
+                if mode == 'snapcompact':
+                    self.assertIn(archive_message(restored), out)
+                    self.assertEqual(out[:4], restored[:4])
+                    self.assertEqual(images(out)[:1], images(first))
+                else:
+                    self.assertEqual(len(artifacts(out)), 1)
+                    self.assertFalse(images(out))
+                    self.assertIn("[snapcompact:gap]", text_of(archive_message(out)))
+
+    def test_legacy_leading_archive_stays_after_original_head_on_fresh_engine(self):
+        first = self.engine.compress(history())
+        source, active = task_history()
+        for with_marker in (True, False):
+            archive = copy.deepcopy(archive_message(first))
+            if not with_marker:
+                archive['content'][0]['text'] = archive['content'][0]['text'].split('\n', 1)[1]
+            legacy = first[:1] + [archive] + first[1:4] + first[5:] + source[1:]
+            for mode in ('snapcompact', 'summarize'):
+                with self.subTest(with_marker=with_marker, mode=mode):
+                    fresh = engine_module.SnapcompactEngine()
+                    fresh.mode = mode
+                    fresh.set_llm(self.engine._llm)
+                    out = fresh.compress(legacy)
+                    self.assertEqual(out[-len(active):], active)
+                    if mode == 'snapcompact':
+                        self.assertEqual(out[:4], first[:4])
+                        self.assertEqual(out[4], archive)
+                        self.assertEqual(images(out)[:1], images([archive]))
+                    else:
+                        self.assertEqual(len(artifacts(out)), 1)
+                        self.assertFalse(images(out))
+                        self.assertIn("[snapcompact:gap]", text_of(archive_message(out)))
+
+    def test_legacy_archive_without_savings_leaves_original_transcript_intact(self):
+        first = self.engine.compress(history())
+        legacy = first[:1] + [archive_message(first)] + first[1:4] + first[5:]
+        before = copy.deepcopy(legacy)
+        render_count = len(self.rendered)
+        for mode in ("snapcompact", "summarize"):
+            with self.subTest(mode=mode):
+                fresh = engine_module.SnapcompactEngine()
+                fresh.mode = mode
+                fresh.set_llm(self.engine._llm)
+                with patch.object(fresh, "_shrink_check", return_value=None):
+                    self.assertIs(fresh.compress(legacy), legacy)
+                self.assertEqual(legacy, before)
+        self.assertEqual(len(self.rendered), render_count)
+
+    def test_fold_only_places_archive_before_long_active_turn(self):
+        _, active = task_history()
+        for mode in ('snapcompact', 'summarize'):
+            with self.subTest(mode=mode):
+                fresh = self.summarizer() if mode == 'summarize' else self.engine
+                fresh.mode = mode
+                older = [legacy_summary(1), legacy_summary(2)]
+                for message in older:
+                    message['content'][0]['text'] += 'Archived material. ' * 3000
+                source = older + active
+                out = fresh.compress(source)
+                self.assertEqual(out[-len(active):], active)
+                self.assertEqual(len(artifacts(out)), 1)
+                self.assertEqual(out[0], archive_message(out))
+
     def test_repeated_frames_replace_predecessor(self):
         first = self.engine.compress(history())
         second = self.engine.compress(extend(first))
@@ -181,7 +337,7 @@ class EngineTests(unittest.TestCase):
         source = history()
         first = self.engine.compress(source)
         # A genuinely later identical batch, following a committed artifact.
-        new_messages = [source[0], first[1]] + copy.deepcopy(source[1:])
+        new_messages = [source[0], archive_message(first)] + copy.deepcopy(source[1:])
         self.engine.compress(new_messages)
         self.assertEqual(self.rendered[-1].count("FIRST_5:"), 2)
 
@@ -386,7 +542,7 @@ class EngineTests(unittest.TestCase):
 
     def assert_one_summary(self, out):
         self.assertEqual(len(artifacts(out)), 1)
-        self.assertIn(engine_module._SUMMARY_HEADER, text_of(out[1]))
+        self.assertIn(engine_module._SUMMARY_HEADER, text_of(archive_message(out)))
 
     def test_prompt_file_is_read_at_every_compaction(self):
         path = self.prompt_file("PROMPT_V1: write Ada's handoff.\n")
